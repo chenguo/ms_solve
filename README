@@ -1,0 +1,6 @@
+*******************************************************************************
+  Minesweeper Consistency Solver
+*******************************************************************************
+  The minesweeper consistency problem is stated as follows:
+  Given a ROWSxCOLS minesweeper grid of some exposed tiles numbering the mines
+surrounding them, does there exist a valid placement of n mines?
