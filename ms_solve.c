@@ -33,7 +33,7 @@ static int total_mines;       // Total possible mine positions.
 static int dim_x;
 static int dim_y;
 static int ntiles;
-
+static int goal_states;
 
 int main (int argc, char **argv)
 {
@@ -225,19 +225,29 @@ static inline void clear_mines (int mine_num)
 static void board_print ()
 {
   int i, j;
+  int index = dim_x + 1;
 
+  /*
   printf ("+");
   for (j = 0; j < dim_x - 2; j++)
     printf ("---+");
+  */
 
   for (i = 1; i < dim_y - 1; i++)
     {
-      printf ("\n|");
+      for (j = 1; j < dim_x - 1; j++)
+        {
+          printf ("%c", grid[index++]);
+        }
+      printf ("\n");
+      index += 2;
+      /*printf ("\n|");
       for (j = 1; j < dim_x - 1; j++)
         printf (" %c |", grid[i * dim_x + j]);
       printf ("\n+");
       for (j = 0; j < dim_x - 2; j++)
-        printf ("---+");
+      printf ("---+");
+      */
     }
   printf ("\n\n");
 }
