@@ -1,6 +1,26 @@
+#! /usr/bin/perl
 # Minesweeper grid generator.
 
 my $ARGC = @ARGV;
+
+if ($ARGV[1] == "--help" || $ARGV[1] == "-h")
+{
+    print
+"Minesweeper grid generator usage:
+
+  ms_gen.pl DIM_X DIM_Y MINES Q_PCT
+    DIM_X: width of the board.
+    DIM_Y: height of the board.
+    MINES: mines to generate.
+    Q_PCT: percentage of the board to turn into ?s.
+
+  ms_gen.pl -h
+  ms_gen.pl --help
+    Print this help message.
+";
+    exit 0;
+}
+
 if ($ARGC < 4)
 {
     print STDERR "Not enough arguments.\n";
