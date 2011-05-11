@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 /* Function prototypes. */
@@ -22,7 +23,7 @@ static void help ();
 
 /* Defines. */
 #define INBUF_SIZ 1024
-#define MINE_UNKNOWN '?'
+#define UNKNOWN '?'
 #define MINE_ON '*'
 #define MINE_OFF '-'
 
@@ -35,16 +36,24 @@ static int dim_y;
 static int ntiles;
 static int goal_states;
 
+static bool print = false;    // Print boards.
+static bool single = true;  // Find all solutions (opposed to just one)
+
 int main (int argc, char **argv)
 {
   char c;
   bool brute = true;
 
   /* Parse arguments. */
-  while ((c = getopt (argc, argv, "bho")) != -1)
+  while ((c = getopt (argc, argv, "abhop")) != -1)
     {
       switch (c)
         {
+          /* Find all solutions. */
+        case 'a':
+          single = false;
+          break;
+
           /* Brute force. */
         case 'b':
           brute = true;
@@ -58,6 +67,11 @@ int main (int argc, char **argv)
         case 'o':
           brute = false;
           break;
+
+          /* Print. */
+        case 'p':
+          print = true;
+          break;
         }
     }
 
@@ -70,6 +84,12 @@ int main (int argc, char **argv)
 
       /* Parse the file and allocate grids buffer. */
       parse_input (file);
+
+      /* Begin processing file. Start timer. */
+      struct timeval timer_start;
+      struct timeval timer_end;
+      gettimeofday (&timer_start, NULL);
+
       total_mines = find_mines ();
 
       /* Attempt to solve the board. */
@@ -79,6 +99,12 @@ int main (int argc, char **argv)
         num_goals = solve_opt ();
 
       printf ("Number of goal states: %d\n", num_goals);
+      gettimeofday (&timer_end, NULL);
+      long msec_start = timer_start.tv_sec * 1000 + timer_start.tv_usec;
+      long msec_end = timer_end.tv_sec * 1000 + timer_end.tv_usec;
+      long msec_elap = msec_end - msec_start;
+      printf ("Time elapsed: %ld ms\n", msec_elap);
+
     }
 }
 
@@ -91,6 +117,9 @@ static int solve_brute ()
 {
   // Set first mine to off and explore subtree.
   int num_goals = solve_subtree (0, false);
+
+  if (single && num_goals)
+    return num_goals;
 
   // Set first mine to on and explore subtree.
   clear_mines (0);
@@ -114,13 +143,17 @@ static int solve_subtree (int mine_num, bool mine_on)
       // Set next mine to off and explore subtree.
       num_goals = solve_subtree (mine_num, false);
 
+      if (single && num_goals)
+        return num_goals;
+
       // Set next mine to on and explore subtree.
       clear_mines (mine_num);
       num_goals += solve_subtree (mine_num, true);
     }
   else if (consis && mine_num == total_mines)
     {
-      board_print ();
+      if (print)
+        board_print ();
       num_goals = 1;
     }
 
@@ -169,7 +202,7 @@ static bool consistency_check (int mine_num)
                   int probe_offset = tile_offset + k * dim_x + l;
                   if (grid[probe_offset] == MINE_ON)
                     mines++;
-                  else if (grid[probe_offset] == MINE_UNKNOWN)
+                  else if (grid[probe_offset] == UNKNOWN)
                     unknowns++;
                 }
             // Check if tile is consistent.
@@ -193,7 +226,7 @@ static int find_mines ()
   /* Search for question marks and save pointers to them. */
   while (1)
     {
-      *mine_iter = strchr (grid_iter, MINE_UNKNOWN);
+      *mine_iter = strchr (grid_iter, UNKNOWN);
       if (*mine_iter)
         {
           grid_iter = *mine_iter++ + 1;
@@ -206,12 +239,12 @@ static int find_mines ()
   return mine_count;
 }
 
-/* Set mines to MINE_UNKNOWN from MINE_NUM onwards. */
+/* Set mines to UNKNOWN from MINE_NUM onwards. */
 static inline void clear_mines (int mine_num)
 {
   char **mine_iter = mines + mine_num;
   while (*mine_iter)
-    **(mine_iter++) = MINE_UNKNOWN;
+    **(mine_iter++) = UNKNOWN;
 }
 
 
@@ -227,12 +260,6 @@ static void board_print ()
   int i, j;
   int index = dim_x + 1;
 
-  /*
-  printf ("+");
-  for (j = 0; j < dim_x - 2; j++)
-    printf ("---+");
-  */
-
   for (i = 1; i < dim_y - 1; i++)
     {
       for (j = 1; j < dim_x - 1; j++)
@@ -241,13 +268,6 @@ static void board_print ()
         }
       printf ("\n");
       index += 2;
-      /*printf ("\n|");
-      for (j = 1; j < dim_x - 1; j++)
-        printf (" %c |", grid[i * dim_x + j]);
-      printf ("\n+");
-      for (j = 0; j < dim_x - 2; j++)
-      printf ("---+");
-      */
     }
   printf ("\n\n");
 }
