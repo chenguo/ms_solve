@@ -14,8 +14,8 @@ static int solve_brute ();
 static int solve_opt ();
 static int solve_subtree (int, bool);
 static bool consistency_check (int);
-static int find_mines ();
-static void clear_mines (int);
+static int find_unknowns ();
+static void clear_unknowns (int);
 
 static void board_print ();
 static void parse_input ();
@@ -90,7 +90,7 @@ int main (int argc, char **argv)
       struct timeval timer_end;
       gettimeofday (&timer_start, NULL);
 
-      total_mines = find_mines ();
+      total_mines = find_unknowns ();
 
       /* Attempt to solve the board. */
       if (brute)
@@ -122,7 +122,7 @@ static int solve_brute ()
     return num_goals;
 
   // Set first mine to on and explore subtree.
-  clear_mines (0);
+  clear_unknowns (0);
   num_goals += solve_subtree (0, true);
 
   return num_goals;
@@ -147,7 +147,7 @@ static int solve_subtree (int mine_num, bool mine_on)
         return num_goals;
 
       // Set next mine to on and explore subtree.
-      clear_mines (mine_num);
+      clear_unknowns (mine_num);
       num_goals += solve_subtree (mine_num, true);
     }
   else if (consis && mine_num == total_mines)
@@ -217,7 +217,7 @@ static bool consistency_check (int mine_num)
 /* Allocate mine position array, and find the mines in the original grid.
    Returns the number of unknown tiles on the grid.
 */
-static int find_mines ()
+static int find_unknowns ()
 {
   char *grid_iter = grid;
   char **mine_iter = mines;
@@ -240,7 +240,7 @@ static int find_mines ()
 }
 
 /* Set mines to UNKNOWN from MINE_NUM onwards. */
-static inline void clear_mines (int mine_num)
+static inline void clear_unknowns (int mine_num)
 {
   char **mine_iter = mines + mine_num;
   while (*mine_iter)
