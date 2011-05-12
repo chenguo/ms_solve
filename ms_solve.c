@@ -15,6 +15,8 @@
 #define UNKNOWN '?'
 #define MINE_ON '*'
 #define MINE_OFF '-'
+#define LOCK {pthread_mutex_lock (&thr_lock);}
+#define UNLOCK {pthread_mutex_unlock (&thr_lock);}
 
 /*****************************************************************************
  *
@@ -41,12 +43,14 @@ struct buffers
 struct search
 {
   pthread_t thread;           // Thread object.
+  bool avail;                 // Available flag.
   struct buffers bufs;        // Thread individual buffers used for search.
 };
 
 /* solve_tree () arguments for threading. */
-struct st_args
+struct thr_args
 {
+  int thread_num;             // Number of thread being used.
   int unknown_num;            // Number of unknown being inspected.
   int mine_count;             // Number of mines turned on thus far.
   struct buffers bufs;        // Buffers used for searching.
@@ -63,7 +67,7 @@ static int nrows;
 static int ncols;
 static int ntiles;
 static int total_unknowns;       // Total possible mine positions.
-static int goal_states;
+static int goal_states = 0;      // Total goal states found, with constraints.
 static bool print = false;       // Print boards.
 static bool single = true;       // Find all solutions (opposed to just one)
 static int mine_target = -1;        // Number of desired mines in solution.
@@ -77,6 +81,7 @@ static pthread_cond_t thr_cond;  // Thread control cond var.
 
 /* Function prototypes. */
 static void optimize_grid ();
+static void * solve_tree_thr (void *);
 static int solve_tree (int, int, struct buffers);
 static bool consistency_check (struct ind, int **grid);
 static int find_unknowns (int **, struct ind *);
@@ -156,16 +161,23 @@ int main (int argc, char **argv)
   struct timeval timer_start;
   gettimeofday (&timer_start, NULL);
 
-  total_unknowns =
-    find_unknowns (thr_data[0].bufs.grid, thr_data[0].bufs.ind);
-
   // If not brutefoce, optimize board first.
   if (!brute)
     optimize_grid ();
 
-  // Attempt to find a solution, or multiple solutions.
-  num_goals = solve_tree (0, 0, thr_data[0].bufs);
-  printf ("Number of goal states: %d\n", num_goals);
+  total_unknowns =
+    find_unknowns (thr_data[0].bufs.grid, thr_data[0].bufs.ind);
+
+  // Attempt to find a solution, or multiple solutions. Spin off thread in
+  // thread 0, and wait for results.
+  LOCK;
+  struct thr_args args = {0, 0, 0, thr_data[0].bufs};
+  pthread_create (&thr_data[0].thread, NULL, solve_tree_thr, &args);
+  pthread_detach (&thr_data[0].thread);
+  pthread_cond_wait (&thr_cond, &thr_lock);
+  UNLOCK;
+
+  printf ("Number of goal states: %d\n", goal_states);
 
   // Find elapsed time in us.
   struct timeval timer_end;
@@ -192,10 +204,26 @@ static void optimize_grid ()
 {}
 
 /* Threaded function call for solve_tree. */
-void * solve_tree_thr (void *args)
+static void * solve_tree_thr (void *data)
 {
+  struct thr_args *args = (struct thr_args *) data;
+  int num_goals = solve_tree (args->unknown_num, args->mine_count, args->bufs);
 
+  // Critical section.
+  LOCK;
+  // Update the number of goals found.
+  goal_states += num_goals;
 
+  // Indicate our thread as being availabe.
+  thr_data[args->thread_num].avail = true;
+
+  // If we are the last thread to exit, execution is complete.
+  if (++avail_threads == max_threads)
+    pthread_cond_signal (&thr_cond);
+
+  UNLOCK;
+
+  return NULL;
 }
 
 /* Solve the game board with brute force algorithm. The algorithm takes a trial
@@ -370,6 +398,9 @@ static void thread_struct_alloc ()
   int i;
   for (i = 0; i < max_threads; i++)
     {
+      thr_data[i].avail = true;
+
+      // Allocate memory for buffers.
       thr_data[i].bufs.buf = (int *) malloc (ntiles * sizeof (int));
       thr_data[i].bufs.grid = (int **) malloc (nrows * sizeof (int *));
       thr_data[i].bufs.ind =
@@ -481,6 +512,10 @@ static void parse_input (char *file)
   // Now that the dimensions are known, we can finish allocating
   // buffers for each thread structure.
   thread_struct_alloc ();
+
+  // Thread 0's buffers will now be filled. Mark it as in use.
+  thr_data[0].avail = false;
+  avail_threads--;
 
   // Set outside boundary to off. For efficiency, loops are not combined.
   int i;
