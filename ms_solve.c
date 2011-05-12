@@ -9,159 +9,248 @@
 #include <sys/time.h>
 #include <unistd.h>
 
-/* Function prototypes. */
-static int solve_brute ();
-static int solve_opt ();
-static int solve_subtree (int, bool);
-static bool consistency_check (int);
-static int find_unknowns ();
-static void clear_unknowns (int);
-
-static void board_print ();
-static void parse_input ();
-static void help ();
-
 /* Defines. */
 #define INBUF_SIZ 1024
+#define TILE_ADJUST 0
 #define UNKNOWN '?'
 #define MINE_ON '*'
 #define MINE_OFF '-'
 
-/* Globals. */
-static char *grid;            // Minesweeper grid.
-static char **mines;          // Pointers to mines.
-static int total_mines;       // Total possible mine positions.
-static int dim_x;
-static int dim_y;
-static int ntiles;
-static int goal_states;
+/*****************************************************************************
+ *
+ *  Structures
+ *
+ ****************************************************************************/
 
-static bool print = false;    // Print boards.
-static bool single = true;  // Find all solutions (opposed to just one)
+/* Index in 2D grid. */
+struct ind
+{
+  int row;
+  int col;
+};
+
+/* Per thread data. */
+struct search
+{
+  pthread_t thread;           // Thread object.
+  int *buf;              // Array for grid.
+  int **grid;                 // 2D array for grid.
+  struct ind *ind;            // Array of indices to unknowns.
+};
+
+
+/*****************************************************************************
+ *
+ *  Globals
+ *
+ ****************************************************************************/
+
+/* Globals. */
+static int nrows;
+static int ncols;
+static int ntiles;
+static int total_unknowns;       // Total possible mine positions.
+static int goal_states;
+static bool print = false;       // Print boards.
+static bool single = true;       // Find all solutions (opposed to just one)
+static int mine_target = -1;        // Number of desired mines in solution.
+
+/* For thread control */
+static int max_threads = 1;      // Threads to use.
+static int avail_threads = 1;    // Available threads.
+static struct search *thr_data;  // Array of search data, for threads.
+static pthread_mutex_t thr_lock; // Thread control mutex.
+static pthread_cond_t thr_cond;  // Thread control cond var.
+
+/* Function prototypes. */
+static void pre_optimize ();
+static int solve_tree (int, struct search, int);
+static bool consistency_check (struct ind, int **grid);
+static int find_unknowns (int **, struct ind *);
+static void clear_unknowns (int, struct ind *, int **);
+
+static void thread_alloc ();
+static void thread_struct_alloc ();
+static void thread_free ();
+static void thread_copy (int, int);
+
+static void board_print (int **);
+static void parse_input (char *);
+static void help ();
+
 
 int main (int argc, char **argv)
 {
   char c;
-  bool brute = true;
+  bool brute = false;
 
-  /* Parse arguments. */
-  while ((c = getopt (argc, argv, "abhop")) != -1)
+  // Parse arguments.
+  while ((c = getopt (argc, argv, "abhmopt")) != -1)
     {
       switch (c)
         {
-          /* Find all solutions. */
+          // Find all solutions.
         case 'a':
           single = false;
           break;
 
-          /* Brute force. */
+          // Brute force.
         case 'b':
           brute = true;
           break;
 
-          /* Help. Does not return. */
+          // Help. Does not return.
         case 'h':
           help ();
 
-          /* Optimized. */
+          // Target number of mines.
+        case 'm':
+          mine_target = atoi (argv[optind++]);
+          break;
+
+          // Optimized.
         case 'o':
           brute = false;
           break;
 
-          /* Print. */
+          // Print.
         case 'p':
           print = true;
+          break;
+
+          // Threads tp use.
+        case 't':
+          max_threads = atoi(argv[optind++]);
+          // Current thread is a thread, so max-1 are available.
+          avail_threads = max_threads - 1;
+          printf ("Using %d threads\n", avail_threads);
           break;
         }
     }
 
-  /* Cycle through input files. */
-  while (argv[optind])
-    {
-      int num_goals = 0;
-      char *file = argv[optind++];
-      printf ("Processing file %s\n", file);
+  int num_goals = 0;
+  char *file = argv[optind];
+  printf ("Processing file %s\n", file);
 
-      /* Parse the file and allocate grids buffer. */
-      parse_input (file);
+  // Allocate structures for threads.
+  thread_alloc ();
 
-      /* Begin processing file. Start timer. */
-      struct timeval timer_start;
-      struct timeval timer_end;
-      gettimeofday (&timer_start, NULL);
+  // Parse the input file. The buffers for each thread structure
+  // is allocated here.
+  parse_input (file);
 
-      total_mines = find_unknowns ();
+  // Begin processing file. Start timer.
+  struct timeval timer_start;
+  gettimeofday (&timer_start, NULL);
 
-      /* Attempt to solve the board. */
-      if (brute)
-        num_goals = solve_brute ();
-      else
-        num_goals = solve_opt ();
+  total_unknowns = find_unknowns (thr_data[0].grid, thr_data[0].ind);
 
-      printf ("Number of goal states: %d\n", num_goals);
-      gettimeofday (&timer_end, NULL);
-      long msec_start = timer_start.tv_sec * 1000 + timer_start.tv_usec;
-      long msec_end = timer_end.tv_sec * 1000 + timer_end.tv_usec;
-      long msec_elap = msec_end - msec_start;
-      printf ("Time elapsed: %ld ms\n", msec_elap);
+  // If not brutefoce, optimize board first.
+  if (!brute)
+    pre_optimize ();
 
-    }
+  // Attempt to find a solution, or multiple solutions.
+  num_goals = solve_tree (0, thr_data[0], 0);
+  printf ("Number of goal states: %d\n", num_goals);
+
+  // Find elapsed time in us.
+  struct timeval timer_end;
+  gettimeofday (&timer_end, NULL);
+  long usec = timer_end.tv_sec * 1000000 + timer_end.tv_usec
+    - timer_start.tv_sec * 1000000 - timer_start.tv_usec;
+  printf ("Time elapsed: %ld us\n", usec);
+
+  // Free thread resources.
+  thread_free ();
 }
+
+
+
+/*****************************************************************************
+ *
+ *  Solver functions.
+ *
+ ****************************************************************************/
+
+/* This function attempts to resolve some unknown tiles before we start the
+   search. Essentially, this will reduce the depth of the search tree. */
+static void pre_optimize ()
+{}
+
 
 /* Solve the game board with brute force algorithm. The algorithm takes a trial
    and error approach, placing one mine at a time. Backtracking and pruning of
    the search tree are employed when an inconsistent game board is encountered.
    This algorithm is based on Neville Mehta's, ported from Lisp to C++ by
    Meredith Kadlac. */
-static int solve_brute ()
+static int solve_tree (int unknown_num, struct search thr_data, int mine_count)
 {
-  // Set first mine to off and explore subtree.
-  int num_goals = solve_subtree (0, false);
-
-  if (single && num_goals)
-    return num_goals;
-
-  // Set first mine to on and explore subtree.
-  clear_unknowns (0);
-  num_goals += solve_subtree (0, true);
-
-  return num_goals;
-}
-
-/* Solve a subtree of the mine possibilities. */
-static int solve_subtree (int mine_num, bool mine_on)
-{
+  int row = thr_data.ind[unknown_num].row;
+  int col = thr_data.ind[unknown_num].col;
+  bool consis;
   int num_goals = 0;
 
-  // Turn the mine on or off.
-  *mines[mine_num] = (mine_on)? MINE_ON : MINE_OFF;
-
-  // Check consistency.
-  bool consis = consistency_check (mine_num++);
-  if (consis && mine_num < total_mines)
+  // Keep mine off. Check for consistency.
+  thr_data.grid[row][col] = MINE_OFF;
+  consis = consistency_check (thr_data.ind[unknown_num], thr_data.grid);
+  if (consis)
     {
-      // Set next mine to off and explore subtree.
-      num_goals = solve_subtree (mine_num, false);
-
-      if (single && num_goals)
-        return num_goals;
-
-      // Set next mine to on and explore subtree.
-      clear_unknowns (mine_num);
-      num_goals += solve_subtree (mine_num, true);
+      // The MINE_OFF state for this mine is valid.
+      if (unknown_num < total_unknowns - 1
+          && (mine_target == -1 || mine_count <= mine_target))
+        {
+          // A subtree exists, and if MINE_TARGET is specified, we have
+          // not exceeded it. Check subtree for valid solutions.
+          num_goals = solve_tree (unknown_num + 1, thr_data, mine_count);
+        }
+      else if (unknown_num == total_unknowns - 1
+               && (mine_target == -1 || mine_count == mine_target))
+        {
+          // 1) All unknowns have been assigned a valid state.
+          // 2) MINE_TARGET wasn't specified, or it has been reached.
+          // Thus, we have found a solution.
+          num_goals++;
+          if (print)
+            board_print (thr_data.grid);
+        }
+      // The remaining cases are
+      // 1) MINE_TARGET is specified and exceeded
+      // 2) MINE_TARGET is specified and not reached, but unknown tiles have
+      //    all been assigned.
+      // In both of these cases, no solution is found. NUM_GOALS remains 0.
     }
-  else if (consis && mine_num == total_mines)
+
+  // Turn mine on. This case is invalid if:
+  // 1) SINGLE is set and a goal state has been found.
+  // 2) MINE_TARGET is set and has been reached.
+  if (single && num_goals || (mine_target >= 0 && mine_count == mine_target))
+      return num_goals;
+
+  // Turn mine on. Check for consistency.
+  clear_unknowns (unknown_num + 1, thr_data.ind, thr_data.grid);
+  thr_data.grid[row][col] = MINE_ON;
+  consis = consistency_check (thr_data.ind[unknown_num], thr_data.grid);
+  if (consis)
     {
-      if (print)
-        board_print ();
-      num_goals = 1;
+      // The MINE_ON state for this mine is valid.
+      mine_count++;
+
+      if (unknown_num < total_unknowns -1
+          && (mine_target == -1 || mine_count <= mine_target))
+        {
+          num_goals += solve_tree (unknown_num + 1, thr_data, mine_count);
+        }
+      else if (unknown_num == total_unknowns - 1
+               && (mine_target == -1 || mine_count == mine_target))
+        {
+          num_goals++;
+          if (print)
+            board_print (thr_data.grid);
+        }
     }
 
   return num_goals;
 }
-
-static int solve_opt ()
-{}
 
 /*
    This function only checks the tiles around the mine that was most recently
@@ -173,154 +262,236 @@ static int solve_opt ()
    Q: unknown tiles surrounding tile.
    A tile is consistent if M <= N <= M + Q
 */
-static bool consistency_check (int mine_num)
+static bool consistency_check (struct ind index, int **grid)
 {
-  // Derive coordinates of mine.
-  int mine_offset = mines[mine_num] - grid;
-  int row = mine_offset / dim_y;
-  int col = mine_offset % dim_y;
-
-  // For each numbered tile around mine.
+  int row = index.row;
+  int col = index.col;
   int i;
   int j;
+
   for (i = -1; i < 2; i++)
     for (j = -1; j < 2; j++)
       {
-        int tile_offset = (row + i) * dim_x + col + j;
-        int tile_num = grid[tile_offset] - '0';
+        // For each numbered tile around mine:
+        int tile_num = grid[row][col] + TILE_ADJUST;
         if (0 <= tile_num && tile_num <= 8)
           {
-            int mines = 0;
-            int unknowns = 0;
+            int local_mines = 0;
+            int local_unknowns = 0;
             int k;
             int l;
 
-            // Count number of mines and unknowns around tile.
+            // Count number of mines and unknowns aroudn tile.
             for (k = -1; k < 2; k++)
               for (l = -1; l < 2; l++)
                 {
-                  int probe_offset = tile_offset + k * dim_x + l;
-                  if (grid[probe_offset] == MINE_ON)
-                    mines++;
-                  else if (grid[probe_offset] == UNKNOWN)
-                    unknowns++;
+                  if (grid[i+k][l+k] == MINE_ON)
+                    local_mines++;
+                  else if (grid[i+k][l+k] == UNKNOWN)
+                    local_unknowns++;
                 }
-            // Check if tile is consistent.
-            if (tile_num < mines || tile_num > mines + unknowns)
+
+            // Perform the consistency check.
+            if (tile_num < local_mines
+                || tile_num > local_mines + local_unknowns)
               return false;
           }
       }
-
   return true;
 }
 
-/* Allocate mine position array, and find the mines in the original grid.
-   Returns the number of unknown tiles on the grid.
-*/
-static int find_unknowns ()
+/* Find the unknowns in the grid, and establish the indices. */
+static int find_unknowns (int **grid, struct ind *ind)
 {
-  char *grid_iter = grid;
-  char **mine_iter = mines;
-  int mine_count = 0;
+  int i, j, n = 0;
+  for (i = 1; i < nrows - 1; i++)
+    for (j = 1; j < ncols - 1; j++)
+      {
+        if (grid[i][j] == UNKNOWN)
+          {
+            ind[n].row = i;
+            ind[n++].col = j;
+          }
+      }
+  ind[n].row = -1;
+  ind[n].col = -1;
+  return n;
+}
 
-  /* Search for question marks and save pointers to them. */
-  while (1)
+/* Set mines to UNKNOWN from I onwards. */
+static inline void clear_unknowns (int i, struct ind *ind, int **grid)
+{
+  while (i < total_unknowns)
+    grid[ind[i].row][ind[i++].col] = UNKNOWN;
+}
+
+
+/*****************************************************************************
+ *
+ *  Thread control functions.
+ *
+ ****************************************************************************/
+
+/* Allocate thread memory. Called at the start of the program. */
+static void thread_alloc ()
+{
+  pthread_mutex_init (&thr_lock, NULL);
+  pthread_cond_init (&thr_cond, NULL);
+  thr_data = (struct search *) malloc (avail_threads * sizeof *thr_data);
+}
+
+/* Call after input file is read, and thus board dimensions are known. We can
+   now appropriately allocate the remaning structures.
+   Note that here, the first struct has been allocated for us by the parsing
+   function. */
+static void thread_struct_alloc ()
+{
+  int i;
+  for (i = 0; i < max_threads; i++)
     {
-      *mine_iter = strchr (grid_iter, UNKNOWN);
-      if (*mine_iter)
+      thr_data[i].buf = (int *) malloc (ntiles * sizeof (int));
+      thr_data[i].grid = (int **) malloc (nrows * sizeof (int *));
+      thr_data[i].ind =
+        (struct ind *) malloc ((ntiles + 1) * sizeof (struct ind));
+
+      // GRID is a 2D array of [row][col] ordering, so GRID is an array of pointers
+      // to the start of each row.
+      int j;
+      int *buf_iter = thr_data[i].buf;
+      for (j = 0; j < nrows; j++)
         {
-          grid_iter = *mine_iter++ + 1;
-          mine_count++;
+          thr_data[i].grid[j] = buf_iter;
+          buf_iter += ncols;
         }
-      else
-        break;
     }
-
-  return mine_count;
 }
 
-/* Set mines to UNKNOWN from MINE_NUM onwards. */
-static inline void clear_unknowns (int mine_num)
+
+
+/* At the end of the program, free thread memory. */
+static void thread_free ()
 {
-  char **mine_iter = mines + mine_num;
-  while (*mine_iter)
-    **(mine_iter++) = UNKNOWN;
+  pthread_mutex_destroy (&thr_lock, NULL);
+  pthread_cond_destroy (&thr_cond, NULL);
+  int i;
+  for (i = 0; i < max_threads; i++)
+    {
+      free (thr_data[i].buf);
+      free (thr_data[i].grid);
+      free (thr_data[i].ind);
+    }
+  free (thr_data);
+}
+
+/* Copy thread ORIG's data to thread CPY's thread data structure. */
+static void thread_copy (int cpy, int orig)
+{
+  memcpy (thr_data[cpy].buf, thr_data[orig].buf, ntiles * sizeof (int));
+  memcpy (thr_data[cpy].ind, thr_data[orig].ind,
+          (total_unknowns + 1) * sizeof (struct ind));
+
+  // GRID is a 2D array of [row][col] ordering, so GRID is an array of pointers
+  // to the start of each row.
+  int i;
+  int *buf_iter = thr_data[cpy].buf;
+  for (i = 0; i < nrows; i++)
+    {
+      thr_data[cpy].grid[i] = buf_iter;
+      buf_iter += ncols;
+    }
 }
 
 
-///////////////////////////////////////////////////////////////////////////////
-//
-//  Misc. functions.
-//
-//////////////////////////////////////////////////////////////////////////////
+/*****************************************************************************
+ *
+ *  Miscellaneous functions.
+ *
+ ****************************************************************************/
 
 /* Print the game board. */
-static void board_print ()
+static void board_print (int **grid)
 {
   int i, j;
-  int index = dim_x + 1;
-
-  for (i = 1; i < dim_y - 1; i++)
+  for (i = 1; i < nrows - 1; i++)
     {
-      for (j = 1; j < dim_x - 1; j++)
-        {
-          printf ("%c", grid[index++]);
-        }
+      for (j = 1; j < ncols - 1; j++)
+        printf ("%c", grid[i][j]);
       printf ("\n");
-      index += 2;
     }
   printf ("\n\n");
 }
 
-/* Parse input file for initial tile layout. */
+/* Parse input file for initial tile layout. This is done at the beginning
+   of processing each file, so the only thread that should be in use is
+*/
 static void parse_input (char *file)
 {
-  FILE *fh = fopen (file, "r");
   char inbuf[INBUF_SIZ];
-  char *buf_ptr;
-  int i;
+  FILE *fh = fopen (file, "r");
 
-  // First line: dimensions.
+  // Get the dimensions.
   fgets (inbuf, INBUF_SIZ, fh);
-  if (sscanf (inbuf, "%d%*[x ]%d", &dim_x, &dim_y) != 2)
+  if (sscanf (inbuf, "%d%*[x ]%d", &nrows, &ncols) != 2)
     {
       fprintf (stderr, "Invalid dimensions format. ");
       fprintf (stderr, "Please use \"W x H\" format\n");
-      return;
+      exit (1);
     }
-  printf ("Dimensions: %d, %d\n", dim_x, dim_y);
+  if (ncols >= INBUF_SIZ-1)
+    {
+      fprintf (stderr, "NCOLS too big for input buffer.\n");
+      exit (1);
+    }
+  printf ("Dimensions: %d, %d\n", nrows, ncols);
 
-  // Allocate buffer for original grid.
-  dim_x += 2;
-  dim_y += 2;
-  ntiles = dim_x * dim_y;
+  // Add buffer to dimensions.
+  nrows += 2;
+  ncols += 2;
+  ntiles = nrows * ncols;
   if (ntiles <= 0)
     {
       fprintf (stderr, "Invalid dimensions.\n");
-      return;
+      exit (1);
     }
-  grid = malloc ((ntiles + 1) * sizeof (*grid));
 
-  // Set everything to off.
-  for (i = 0; i < ntiles; i++)
-    grid[i] = MINE_OFF;
-  grid[ntiles] = '\0';
+  // Now that the dimensions are known, we can finish allocating
+  // buffers for each thread structure.
+  thread_struct_alloc ();
+
+  // Set outside boundary to off. For efficiency, loops are not combined.
+  int i;
+  int **grid = thr_data[0].grid;
+  for (i = 0; i < ncols; i++)
+    grid[0][i] = MINE_OFF;
+  for (i = 0; i < ncols; i++)
+    grid[nrows-1][i] = MINE_OFF;
+  for (i = 1; i < nrows - 1; i++)
+    {
+      grid[i][0] = MINE_OFF;
+      grid[i][ncols-1] = MINE_OFF;
+    }
+
 
   // Fill in original grid.
-  i = 0;
-  buf_ptr = grid + dim_x + 1;
-  while (i++ < dim_y - 2)
+  int j;
+  for (i = 1; i < nrows; i++)
     {
+      // Read in a row as CHAR.
       fgets (inbuf, INBUF_SIZ, fh);
-      memcpy (buf_ptr, inbuf, dim_x - 2);
-      if (feof (fh) || ferror (fh))
-          break;
-      buf_ptr += dim_x;
-    }
-  board_print ();
+      if (feof (fh))
+        break;
+      if (ferror (fh))
+        {
+          fprintf (stderr, "Error reading file.\n");
+          exit (1);
+        }
 
-  // Allocate space for pointers to potential mines.
-  mines = malloc ((ntiles + 1) * sizeof (*mines));
+      // Copy to grid mapped to INT.
+      for (j = 0; j < ncols-2; j++)
+        grid[i][j+1] = inbuf[j];
+    }
+
+  board_print (grid);
 }
 
 /* Print help message. */
@@ -328,8 +499,14 @@ static void help ()
 {
   printf ("\
 Minesweeper solver. Written by Chen Guo.\n\
+Usage:\n\
+  ms_solve [OPTION]... [FILE]\n\n\
 Options:\n\
-  -b  Brute force algorithm (default).\n\
+  -a  Find all solutions.\n\
+  -b  Brute force algorithm.\n\
   -h  Print this help message.\n\
-  -o  Optimized algorithm.\n");
+  -m  Set a target number of mines.\n\
+  -o  Optimized algorithm.\n\
+  -p  Print solutions.\n\
+  -t  Threads to use.\n\n");
 }
