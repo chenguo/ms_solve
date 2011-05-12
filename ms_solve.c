@@ -29,15 +29,28 @@ struct ind
   int col;
 };
 
-/* Per thread data. */
-struct search
+/* Buffers used for search. */
+struct buffers
 {
-  pthread_t thread;           // Thread object.
-  int *buf;              // Array for grid.
+  int *buf;                   // Array for grid.
   int **grid;                 // 2D array for grid.
   struct ind *ind;            // Array of indices to unknowns.
 };
 
+/* Individual thread data. */
+struct search
+{
+  pthread_t thread;           // Thread object.
+  struct buffers bufs;        // Thread individual buffers used for search.
+};
+
+/* solve_tree () arguments for threading. */
+struct st_args
+{
+  int unknown_num;            // Number of unknown being inspected.
+  int mine_count;             // Number of mines turned on thus far.
+  struct buffers bufs;        // Buffers used for searching.
+};
 
 /*****************************************************************************
  *
@@ -63,8 +76,8 @@ static pthread_mutex_t thr_lock; // Thread control mutex.
 static pthread_cond_t thr_cond;  // Thread control cond var.
 
 /* Function prototypes. */
-static void pre_optimize ();
-static int solve_tree (int, struct search, int);
+static void optimize_grid ();
+static int solve_tree (int, int, struct buffers);
 static bool consistency_check (struct ind, int **grid);
 static int find_unknowns (int **, struct ind *);
 static void clear_unknowns (int, struct ind *, int **);
@@ -143,14 +156,15 @@ int main (int argc, char **argv)
   struct timeval timer_start;
   gettimeofday (&timer_start, NULL);
 
-  total_unknowns = find_unknowns (thr_data[0].grid, thr_data[0].ind);
+  total_unknowns =
+    find_unknowns (thr_data[0].bufs.grid, thr_data[0].bufs.ind);
 
   // If not brutefoce, optimize board first.
   if (!brute)
-    pre_optimize ();
+    optimize_grid ();
 
   // Attempt to find a solution, or multiple solutions.
-  num_goals = solve_tree (0, thr_data[0], 0);
+  num_goals = solve_tree (0, 0, thr_data[0].bufs);
   printf ("Number of goal states: %d\n", num_goals);
 
   // Find elapsed time in us.
@@ -174,25 +188,32 @@ int main (int argc, char **argv)
 
 /* This function attempts to resolve some unknown tiles before we start the
    search. Essentially, this will reduce the depth of the search tree. */
-static void pre_optimize ()
+static void optimize_grid ()
 {}
 
+/* Threaded function call for solve_tree. */
+void * solve_tree_thr (void *args)
+{
+
+
+}
 
 /* Solve the game board with brute force algorithm. The algorithm takes a trial
    and error approach, placing one mine at a time. Backtracking and pruning of
    the search tree are employed when an inconsistent game board is encountered.
    This algorithm is based on Neville Mehta's, ported from Lisp to C++ by
-   Meredith Kadlac. */
-static int solve_tree (int unknown_num, struct search thr_data, int mine_count)
+   Meredith Kadlac, but is much more optimized and performs more than 20x
+   faster. */
+static int solve_tree (int unknown_num, int mine_count, struct buffers bufs)
 {
-  int row = thr_data.ind[unknown_num].row;
-  int col = thr_data.ind[unknown_num].col;
+  int row = bufs.ind[unknown_num].row;
+  int col = bufs.ind[unknown_num].col;
   bool consis;
   int num_goals = 0;
 
   // Keep mine off. Check for consistency.
-  thr_data.grid[row][col] = MINE_OFF;
-  consis = consistency_check (thr_data.ind[unknown_num], thr_data.grid);
+  bufs.grid[row][col] = MINE_OFF;
+  consis = consistency_check (bufs.ind[unknown_num], bufs.grid);
   if (consis)
     {
       // The MINE_OFF state for this mine is valid.
@@ -201,7 +222,7 @@ static int solve_tree (int unknown_num, struct search thr_data, int mine_count)
         {
           // A subtree exists, and if MINE_TARGET is specified, we have
           // not exceeded it. Check subtree for valid solutions.
-          num_goals = solve_tree (unknown_num + 1, thr_data, mine_count);
+          num_goals = solve_tree (unknown_num + 1, mine_count, bufs);
         }
       else if (unknown_num == total_unknowns - 1
                && (mine_target == -1 || mine_count == mine_target))
@@ -211,7 +232,7 @@ static int solve_tree (int unknown_num, struct search thr_data, int mine_count)
           // Thus, we have found a solution.
           num_goals++;
           if (print)
-            board_print (thr_data.grid);
+            board_print (bufs.grid);
         }
       // The remaining cases are
       // 1) MINE_TARGET is specified and exceeded
@@ -227,9 +248,9 @@ static int solve_tree (int unknown_num, struct search thr_data, int mine_count)
       return num_goals;
 
   // Turn mine on. Check for consistency.
-  clear_unknowns (unknown_num + 1, thr_data.ind, thr_data.grid);
-  thr_data.grid[row][col] = MINE_ON;
-  consis = consistency_check (thr_data.ind[unknown_num], thr_data.grid);
+  clear_unknowns (unknown_num + 1, bufs.ind, bufs.grid);
+  bufs.grid[row][col] = MINE_ON;
+  consis = consistency_check (bufs.ind[unknown_num], bufs.grid);
   if (consis)
     {
       // The MINE_ON state for this mine is valid.
@@ -238,14 +259,14 @@ static int solve_tree (int unknown_num, struct search thr_data, int mine_count)
       if (unknown_num < total_unknowns -1
           && (mine_target == -1 || mine_count <= mine_target))
         {
-          num_goals += solve_tree (unknown_num + 1, thr_data, mine_count);
+          num_goals += solve_tree (unknown_num + 1, mine_count, bufs);
         }
       else if (unknown_num == total_unknowns - 1
                && (mine_target == -1 || mine_count == mine_target))
         {
           num_goals++;
           if (print)
-            board_print (thr_data.grid);
+            board_print (bufs.grid);
         }
     }
 
@@ -349,18 +370,19 @@ static void thread_struct_alloc ()
   int i;
   for (i = 0; i < max_threads; i++)
     {
-      thr_data[i].buf = (int *) malloc (ntiles * sizeof (int));
-      thr_data[i].grid = (int **) malloc (nrows * sizeof (int *));
-      thr_data[i].ind =
+      thr_data[i].bufs.buf = (int *) malloc (ntiles * sizeof (int));
+      thr_data[i].bufs.grid = (int **) malloc (nrows * sizeof (int *));
+      thr_data[i].bufs.ind =
         (struct ind *) malloc ((ntiles + 1) * sizeof (struct ind));
 
       // GRID is a 2D array of [row][col] ordering, so GRID is an array of pointers
       // to the start of each row.
       int j;
-      int *buf_iter = thr_data[i].buf;
+      int *buf_iter = thr_data[i].bufs.buf;
+      int **grid = thr_data[i].bufs.grid;
       for (j = 0; j < nrows; j++)
         {
-          thr_data[i].grid[j] = buf_iter;
+          grid[j] = buf_iter;
           buf_iter += ncols;
         }
     }
@@ -376,9 +398,9 @@ static void thread_free ()
   int i;
   for (i = 0; i < max_threads; i++)
     {
-      free (thr_data[i].buf);
-      free (thr_data[i].grid);
-      free (thr_data[i].ind);
+      free (thr_data[i].bufs.buf);
+      free (thr_data[i].bufs.grid);
+      free (thr_data[i].bufs.ind);
     }
   free (thr_data);
 }
@@ -386,17 +408,19 @@ static void thread_free ()
 /* Copy thread ORIG's data to thread CPY's thread data structure. */
 static void thread_copy (int cpy, int orig)
 {
-  memcpy (thr_data[cpy].buf, thr_data[orig].buf, ntiles * sizeof (int));
-  memcpy (thr_data[cpy].ind, thr_data[orig].ind,
+  memcpy (thr_data[cpy].bufs.buf, thr_data[orig].bufs.buf,
+          ntiles * sizeof (int));
+  memcpy (thr_data[cpy].bufs.ind, thr_data[orig].bufs.ind,
           (total_unknowns + 1) * sizeof (struct ind));
 
   // GRID is a 2D array of [row][col] ordering, so GRID is an array of pointers
   // to the start of each row.
   int i;
-  int *buf_iter = thr_data[cpy].buf;
+  int *buf_iter = thr_data[cpy].bufs.buf;
+  int **grid = thr_data[cpy].bufs.grid;
   for (i = 0; i < nrows; i++)
     {
-      thr_data[cpy].grid[i] = buf_iter;
+      grid[i] = buf_iter;
       buf_iter += ncols;
     }
 }
@@ -460,7 +484,7 @@ static void parse_input (char *file)
 
   // Set outside boundary to off. For efficiency, loops are not combined.
   int i;
-  int **grid = thr_data[0].grid;
+  int **grid = thr_data[0].bufs.grid;
   for (i = 0; i < ncols; i++)
     grid[0][i] = MINE_OFF;
   for (i = 0; i < ncols; i++)
