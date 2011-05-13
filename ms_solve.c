@@ -11,12 +11,12 @@
 
 /* Defines. */
 #define INBUF_SIZ 1024
-#define TILE_ADJUST 0
+#define TILE_ADJUST ('0' * -1)
 #define UNKNOWN '?'
 #define MINE_ON '*'
 #define MINE_OFF '-'
-#define LOCK {pthread_mutex_lock (&thr_lock);}
-#define UNLOCK {pthread_mutex_unlock (&thr_lock);}
+#define LOCK {pthread_mutex_lock (thr_lock);}
+#define UNLOCK {pthread_mutex_unlock (thr_lock);}
 
 /*****************************************************************************
  *
@@ -53,7 +53,6 @@ struct thr_args
   int thread_num;             // Number of thread being used.
   int unknown_num;            // Number of unknown being inspected.
   int mine_count;             // Number of mines turned on thus far.
-  struct buffers bufs;        // Buffers used for searching.
 };
 
 /*****************************************************************************
@@ -76,19 +75,20 @@ static int mine_target = -1;        // Number of desired mines in solution.
 static int max_threads = 1;      // Threads to use.
 static int avail_threads = 1;    // Available threads.
 static struct search *thr_data;  // Array of search data, for threads.
-static pthread_mutex_t thr_lock; // Thread control mutex.
-static pthread_cond_t thr_cond;  // Thread control cond var.
+static pthread_mutex_t *thr_lock;    // Thread control mutex.
+static pthread_cond_t *thr_cond; // Thread control cond var.
 
 /* Function prototypes. */
 static void optimize_grid ();
 static void * solve_tree_thr (void *);
-static int solve_tree (int, int, struct buffers);
+static int solve_tree (int, int, int, struct buffers);
 static bool consistency_check (struct ind, int **grid);
 static int find_unknowns (int **, struct ind *);
 static void clear_unknowns (int, struct ind *, int **);
 
 static void thread_alloc ();
 static void thread_struct_alloc ();
+static int thread_find ();
 static void thread_free ();
 static void thread_copy (int, int);
 
@@ -140,7 +140,7 @@ int main (int argc, char **argv)
         case 't':
           max_threads = atoi(argv[optind++]);
           // Current thread is a thread, so max-1 are available.
-          avail_threads = max_threads - 1;
+          avail_threads = max_threads;
           printf ("Using %d threads\n", avail_threads);
           break;
         }
@@ -168,13 +168,14 @@ int main (int argc, char **argv)
   total_unknowns =
     find_unknowns (thr_data[0].bufs.grid, thr_data[0].bufs.ind);
 
-  // Attempt to find a solution, or multiple solutions. Spin off thread in
-  // thread 0, and wait for results.
+  // Attempt to find a solution, or multiple solutions.
+  // Spin off search thread in thread 0, and wait.
+  struct thr_args args = {0, 0, 0};
+  pthread_t thread;
   LOCK;
-  struct thr_args args = {0, 0, 0, thr_data[0].bufs};
-  pthread_create (&thr_data[0].thread, NULL, solve_tree_thr, &args);
-  pthread_detach (&thr_data[0].thread);
-  pthread_cond_wait (&thr_cond, &thr_lock);
+  pthread_create (&thread, NULL, solve_tree_thr, &args);
+  pthread_detach (thread);
+  pthread_cond_wait (thr_cond, thr_lock);
   UNLOCK;
 
   printf ("Number of goal states: %d\n", goal_states);
@@ -184,7 +185,8 @@ int main (int argc, char **argv)
   gettimeofday (&timer_end, NULL);
   long usec = timer_end.tv_sec * 1000000 + timer_end.tv_usec
     - timer_start.tv_sec * 1000000 - timer_start.tv_usec;
-  printf ("Time elapsed: %ld us\n", usec);
+  long msec = usec / 1000;
+  printf ("Time elapsed: %ld ms\n", msec);
 
   // Free thread resources.
   thread_free ();
@@ -207,20 +209,23 @@ static void optimize_grid ()
 static void * solve_tree_thr (void *data)
 {
   struct thr_args *args = (struct thr_args *) data;
-  int num_goals = solve_tree (args->unknown_num, args->mine_count, args->bufs);
+  int thread_num = args->thread_num;
+  struct buffers bufs = thr_data[thread_num].bufs;
+
+  int num_goals = solve_tree (args->unknown_num, args->mine_count,
+                              thread_num, bufs);
 
   // Critical section.
+  // 1) Update goals found.
+  // 2) Mark thread as available.
+  // 3) Check for end of execution.
+  bool signal = false;
   LOCK;
-  // Update the number of goals found.
   goal_states += num_goals;
-
-  // Indicate our thread as being availabe.
-  thr_data[args->thread_num].avail = true;
-
-  // If we are the last thread to exit, execution is complete.
-  if (++avail_threads == max_threads)
-    pthread_cond_signal (&thr_cond);
-
+  thr_data[thread_num].avail = true;
+  avail_threads++;
+  if (avail_threads == max_threads || (single && num_goals))
+    pthread_cond_signal (thr_cond);
   UNLOCK;
 
   return NULL;
@@ -232,7 +237,8 @@ static void * solve_tree_thr (void *data)
    This algorithm is based on Neville Mehta's, ported from Lisp to C++ by
    Meredith Kadlac, but is much more optimized and performs more than 20x
    faster. */
-static int solve_tree (int unknown_num, int mine_count, struct buffers bufs)
+static int solve_tree (int unknown_num, int mine_count, int thread_num,
+                       struct buffers bufs)
 {
   int row = bufs.ind[unknown_num].row;
   int col = bufs.ind[unknown_num].col;
@@ -250,7 +256,41 @@ static int solve_tree (int unknown_num, int mine_count, struct buffers bufs)
         {
           // A subtree exists, and if MINE_TARGET is specified, we have
           // not exceeded it. Check subtree for valid solutions.
-          num_goals = solve_tree (unknown_num + 1, mine_count, bufs);
+          // If a thread is available, perform this in a separate thread.
+          bool create_thread = false;
+          if (avail_threads && (mine_count != mine_target)
+              && (total_unknowns - unknown_num > 3))
+            {
+              LOCK;
+              // Check again after locking. In the time between checking for
+              // an available thread and locking, someone could have taken it.
+              if (avail_threads)
+                create_thread = true;
+              else
+                UNLOCK;
+            }
+          if (create_thread)
+            {
+              // Find a thread, and copy our thread's buffers into it.
+              int new_thr = thread_find ();
+              thr_data[new_thr].avail = false;
+              avail_threads--;
+              UNLOCK;
+
+              thread_copy (new_thr, thread_num);
+              struct thr_args *args = (struct thr_args *) malloc (sizeof *args);
+              args->thread_num = new_thr;
+              args->unknown_num = unknown_num + 1;
+              args->mine_count = mine_count;
+              pthread_t thread;
+              pthread_create (&thread, NULL, solve_tree_thr, args);
+              pthread_detach (thread);
+            }
+          else
+            {
+              num_goals = solve_tree (unknown_num + 1, mine_count,
+                                      thread_num, bufs);
+            }
         }
       else if (unknown_num == total_unknowns - 1
                && (mine_target == -1 || mine_count == mine_target))
@@ -273,7 +313,7 @@ static int solve_tree (int unknown_num, int mine_count, struct buffers bufs)
   // 1) SINGLE is set and a goal state has been found.
   // 2) MINE_TARGET is set and has been reached.
   if (single && num_goals || (mine_target >= 0 && mine_count == mine_target))
-      return num_goals;
+    return num_goals;
 
   // Turn mine on. Check for consistency.
   clear_unknowns (unknown_num + 1, bufs.ind, bufs.grid);
@@ -287,7 +327,7 @@ static int solve_tree (int unknown_num, int mine_count, struct buffers bufs)
       if (unknown_num < total_unknowns -1
           && (mine_target == -1 || mine_count <= mine_target))
         {
-          num_goals += solve_tree (unknown_num + 1, mine_count, bufs);
+          num_goals += solve_tree (unknown_num + 1, mine_count, thread_num, bufs);
         }
       else if (unknown_num == total_unknowns - 1
                && (mine_target == -1 || mine_count == mine_target))
@@ -318,11 +358,12 @@ static bool consistency_check (struct ind index, int **grid)
   int i;
   int j;
 
+  //fprintf (stderr, "Checking [%d][%d]\n", row, col);
   for (i = -1; i < 2; i++)
     for (j = -1; j < 2; j++)
       {
         // For each numbered tile around mine:
-        int tile_num = grid[row][col] + TILE_ADJUST;
+        int tile_num = grid[row+i][col+j] + TILE_ADJUST;
         if (0 <= tile_num && tile_num <= 8)
           {
             int local_mines = 0;
@@ -334,11 +375,14 @@ static bool consistency_check (struct ind index, int **grid)
             for (k = -1; k < 2; k++)
               for (l = -1; l < 2; l++)
                 {
-                  if (grid[i+k][l+k] == MINE_ON)
+                  if (grid[row+i+k][col+j+l] == MINE_ON)
                     local_mines++;
-                  else if (grid[i+k][l+k] == UNKNOWN)
+                  else if (grid[row+i+k][col+j+l] == UNKNOWN)
                     local_unknowns++;
                 }
+
+            //fprintf (stderr, "  grid[%d][%d]: %d:  mines %d  unknowns %d\n",
+            //         row + i, col + j, tile_num, local_mines, local_unknowns);
 
             // Perform the consistency check.
             if (tile_num < local_mines
@@ -360,6 +404,7 @@ static int find_unknowns (int **grid, struct ind *ind)
           {
             ind[n].row = i;
             ind[n++].col = j;
+            //fprintf (stderr, "UNKNOWN at [%d][%d]\n", i, j);
           }
       }
   ind[n].row = -1;
@@ -384,8 +429,10 @@ static inline void clear_unknowns (int i, struct ind *ind, int **grid)
 /* Allocate thread memory. Called at the start of the program. */
 static void thread_alloc ()
 {
-  pthread_mutex_init (&thr_lock, NULL);
-  pthread_cond_init (&thr_cond, NULL);
+  thr_lock = (pthread_mutex_t *) malloc (sizeof *thr_lock);
+  thr_cond = (pthread_cond_t *) malloc (sizeof *thr_cond);
+  pthread_mutex_init (thr_lock, NULL);
+  pthread_cond_init (thr_cond, NULL);
   thr_data = (struct search *) malloc (avail_threads * sizeof *thr_data);
 }
 
@@ -419,13 +466,25 @@ static void thread_struct_alloc ()
     }
 }
 
+/* Find a free thread. Assumes there is a thread available. */
+static int thread_find ()
+{
+  int i;
+  for (i = 0; i < max_threads; i++)
+    if (thr_data[i].avail)
+      return i;
 
+  // If we're still here, no threads are available despite
+  // avail_threads being positive.
+  fprintf (stderr, "Error: Thread control corruption.\n");
+  exit (1);
+}
 
 /* At the end of the program, free thread memory. */
 static void thread_free ()
 {
-  pthread_mutex_destroy (&thr_lock, NULL);
-  pthread_cond_destroy (&thr_cond, NULL);
+  pthread_mutex_destroy (thr_lock, NULL);
+  pthread_cond_destroy (thr_cond, NULL);
   int i;
   for (i = 0; i < max_threads; i++)
     {
@@ -443,17 +502,6 @@ static void thread_copy (int cpy, int orig)
           ntiles * sizeof (int));
   memcpy (thr_data[cpy].bufs.ind, thr_data[orig].bufs.ind,
           (total_unknowns + 1) * sizeof (struct ind));
-
-  // GRID is a 2D array of [row][col] ordering, so GRID is an array of pointers
-  // to the start of each row.
-  int i;
-  int *buf_iter = thr_data[cpy].bufs.buf;
-  int **grid = thr_data[cpy].bufs.grid;
-  for (i = 0; i < nrows; i++)
-    {
-      grid[i] = buf_iter;
-      buf_iter += ncols;
-    }
 }
 
 
@@ -467,9 +515,9 @@ static void thread_copy (int cpy, int orig)
 static void board_print (int **grid)
 {
   int i, j;
-  for (i = 1; i < nrows - 1; i++)
+  for (i = 0; i < nrows; i++)
     {
-      for (j = 1; j < ncols - 1; j++)
+      for (j = 0; j < ncols; j++)
         printf ("%c", grid[i][j]);
       printf ("\n");
     }
@@ -517,23 +565,10 @@ static void parse_input (char *file)
   thr_data[0].avail = false;
   avail_threads--;
 
-  // Set outside boundary to off. For efficiency, loops are not combined.
-  int i;
-  int **grid = thr_data[0].bufs.grid;
-  for (i = 0; i < ncols; i++)
-    grid[0][i] = MINE_OFF;
-  for (i = 0; i < ncols; i++)
-    grid[nrows-1][i] = MINE_OFF;
-  for (i = 1; i < nrows - 1; i++)
-    {
-      grid[i][0] = MINE_OFF;
-      grid[i][ncols-1] = MINE_OFF;
-    }
-
-
   // Fill in original grid.
-  int j;
-  for (i = 1; i < nrows; i++)
+  int i, j;
+  int **grid = thr_data[0].bufs.grid;
+  for (i = 1; i < nrows - 1; i++)
     {
       // Read in a row as CHAR.
       fgets (inbuf, INBUF_SIZ, fh);
@@ -550,7 +585,19 @@ static void parse_input (char *file)
         grid[i][j+1] = inbuf[j];
     }
 
-  board_print (grid);
+  // Set outside boundary to off. For efficiency, loops are not combined.
+  for (i = 0; i < ncols; i++)
+    grid[0][i] = MINE_OFF;
+  for (i = 0; i < ncols; i++)
+    grid[nrows-1][i] = MINE_OFF;
+  for (i = 1; i < nrows - 1; i++)
+    {
+      grid[i][0] = MINE_OFF;
+      grid[i][ncols-1] = MINE_OFF;
+    }
+
+  if (print)
+    board_print (grid);
 }
 
 /* Print help message. */
