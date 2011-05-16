@@ -67,9 +67,11 @@ static int ncols;
 static int ntiles;
 static int total_unknowns;       // Total possible mine positions.
 static int goal_states = 0;      // Total goal states found, with constraints.
-static bool print = false;       // Print boards.
+static bool preresolve = false;  // Preresolve uknowns before search.
 static bool single = true;       // Find all solutions (opposed to just one)
 static int mine_target = -1;     // Number of desired mines in solution.
+enum { PRINT_NONE, PRINT_MIN, PRINT_BASIC, PRINT_ALL };
+static int print = PRINT_BASIC;   // Print boards.
 
 /* For thread control */
 static int max_threads = 1;      // Threads to use.
@@ -79,7 +81,7 @@ static pthread_mutex_t *thr_lock;    // Thread control mutex.
 static pthread_cond_t *thr_cond; // Thread control cond var.
 
 /* Function prototypes. */
-static void optimize_grid ();
+static int preresolve_grid ();
 static void preprocess_grid ();
 static void * solve_tree_thr (void *);
 static int solve_tree (int, int, int, struct buffers);
@@ -100,11 +102,9 @@ static void help ();
 
 int main (int argc, char **argv)
 {
-  char c;
-  bool brute = false;
-
   // Parse arguments.
-  while ((c = getopt (argc, argv, "abhmopt")) != -1)
+  char c;
+  while ((c = getopt (argc, argv, "ahm:op:rt:")) != -1)
     {
       switch (c)
         {
@@ -113,43 +113,38 @@ int main (int argc, char **argv)
           single = false;
           break;
 
-          // Brute force.
-        case 'b':
-          brute = true;
-          break;
-
           // Help. Does not return.
         case 'h':
           help ();
 
           // Target number of mines.
         case 'm':
-          mine_target = atoi (argv[optind++]);
-          break;
-
-          // Optimized.
-        case 'o':
-          brute = false;
+          mine_target = atoi (optarg);
           break;
 
           // Print.
         case 'p':
-          print = true;
+          print = atoi (optarg);
+          break;
+
+          // Pre-resolve unknowns.
+        case 'r':
+          preresolve = true;
           break;
 
           // Threads tp use.
         case 't':
-          max_threads = atoi(argv[optind++]);
+          max_threads = atoi(optarg);
           // Current thread is a thread, so max-1 are available.
           avail_threads = max_threads;
-          printf ("Using %d threads\n", avail_threads);
           break;
         }
     }
 
   int num_goals = 0;
   char *file = argv[optind];
-  printf ("Processing file %s\n", file);
+  if (print >= PRINT_BASIC)
+    printf ("Processing file %s\n", file);
 
   // Allocate structures for threads.
   thread_alloc ();
@@ -163,8 +158,13 @@ int main (int argc, char **argv)
   gettimeofday (&timer_start, NULL);
 
   // If not bruteforce, optimize board first.
-  if (!brute)
-    optimize_grid ();
+  int resolved = 0;
+  if (preresolve)
+    resolved = preresolve_grid ();
+  if (print >= PRINT_MIN)
+    printf ("Pre-resolved unknowns: %d\n", resolved);
+  if (print >= PRINT_BASIC && preresolve)
+    board_print (thr_data[0].bufs.grid);
 
   // Preprocess the grid to prepare for search.
   preprocess_grid ();
@@ -172,25 +172,36 @@ int main (int argc, char **argv)
   total_unknowns =
     find_unknowns (thr_data[0].bufs.grid, thr_data[0].bufs.ind);
 
-  // Attempt to find a solution, or multiple solutions.
-  // Spin off search thread in thread 0, and wait.
-  struct thr_args args = {0, 0, 0};
-  pthread_t thread;
-  LOCK;
-  pthread_create (&thread, NULL, solve_tree_thr, &args);
-  pthread_detach (thread);
-  pthread_cond_wait (thr_cond, thr_lock);
-  UNLOCK;
+  if (total_unknowns > 0)
+    {
+      // Attempt to find a solution, or multiple solutions.
+      // Spin off search thread in thread 0, and wait.
+      struct thr_args args = {0, 0, 0};
+      pthread_t thread;
+      LOCK;
+      pthread_create (&thread, NULL, solve_tree_thr, &args);
+      pthread_detach (thread);
+      pthread_cond_wait (thr_cond, thr_lock);
+      UNLOCK;
+    }
+  else
+    {
+      // Trivially a goal state.
+      if (print >= PRINT_ALL)
+        board_print (thr_data[0].bufs.grid);
+      goal_states++;
+    }
 
-  printf ("Number of goal states: %d\n", goal_states);
+  if (print >= PRINT_BASIC)
+    printf ("Number of goal states: %d\n", goal_states);
 
   // Find elapsed time in us.
   struct timeval timer_end;
   gettimeofday (&timer_end, NULL);
-  long usec = timer_end.tv_sec * 1000000 + timer_end.tv_usec
-    - timer_start.tv_sec * 1000000 - timer_start.tv_usec;
-  long msec = usec / 1000;
-  printf ("Time elapsed: %ld ms\n", msec);
+  double msec = (timer_end.tv_sec * 1000.0) + (timer_end.tv_usec/1000.0)
+    - (timer_start.tv_sec * 1000.0) - (timer_start.tv_usec / 1000.0);
+  if (print >= PRINT_MIN)
+    printf ("Time elapsed: %f ms\n", msec);
 
   // Free thread resources.
   thread_free ();
@@ -204,10 +215,78 @@ int main (int argc, char **argv)
  *
  ****************************************************************************/
 
+/* Given a tile, if it is a numbered tile, count the mines and unknowns around
+   it. If the count matches the tile number, then all unknowns around must be
+   mines. Conversely, if the count matches the mine number, then all unknowns
+   must be off. */
+static int resolve_tile (int row, int col, int **grid)
+{
+
+  struct ind ind[8];
+  int unknowns = 0;
+  int mines = 0;
+  int resolved = 0;
+  int i, j;
+
+  int tile_num = grid[row][col] + TILE_ADJUST;
+  if (tile_num < 0 || tile_num > 8)
+    return 0;
+
+  for (i = -1; i < 2; i++)
+    for (j = -1; j < 2; j++)
+      {
+        // Upon finding an unknown, record it's position.
+        if (grid[row+i][col+j] == UNKNOWN)
+          {
+            ind[unknowns].row = row + i;
+            ind[unknowns++].col = col + j;
+          }
+        else if (grid[row+i][col+j] == MINE_ON)
+          mines++;
+      }
+
+  // If TILE_NUM matches the sum of mines and unkowns, all the unknowns are
+  // mines. If TILE_NUM matches the mines, then all unknowns are off. Set
+  // the unknowns accordingly, and check the tiles around the former
+  // unknowns.
+  bool turn_on;
+  if (tile_num == mines + unknowns)
+    turn_on = true;
+  else if (tile_num == mines)
+    turn_on = false;
+  else
+    return 0;
+
+  resolved = unknowns;
+
+  int k;
+  for (k = 0; k < unknowns; k++)
+    grid[ind[k].row][ind[k].col] = (turn_on)? MINE_ON : MINE_OFF;
+
+  for (k = 0; k < unknowns; k++)
+    {
+      row = ind[k].row;
+      col = ind[k].col;
+      for (i = -1; i < 2; i++)
+        for (j = -1; j < 2; j++)
+          resolved += resolve_tile (row + i, col + j, grid);
+    }
+
+  return resolved;
+}
+
 /* This function attempts to resolve some unknown tiles before we start the
    search. Essentially, this will reduce the depth of the search tree. */
-static void optimize_grid ()
-{}
+static int preresolve_grid ()
+{
+  int i, j;
+  int resolved = 0;
+  int **grid = thr_data[0].bufs.grid;
+  for (i = 1; i < nrows - 1; i++)
+    for (j = 1; j < ncols - 1; j++)
+      resolved += resolve_tile (i, j, grid);
+  return resolved;
+}
 
 /* This function counts the number of current existing mines on the field,
    and adjusts the MINE_TARGET field accordingly. */
@@ -220,10 +299,9 @@ static void preprocess_grid ()
   int i, j;
   int **grid = thr_data[0].bufs.grid;
   for (i = 1; i < nrows - 1; i++)
-    for (j = 1; j < nrows - 1; j++)
+    for (j = 1; j < ncols - 1; j++)
       if (grid[i][j] == MINE_ON)
         mine_target--;
-  //fprintf (stderr, "Adjusted MINE_TARGET: %d\n", mine_target);
 }
 
 
@@ -321,7 +399,7 @@ static int solve_tree (int unknown_num, int mine_count, int thread_num,
           // 2) MINE_TARGET wasn't specified, or it has been reached.
           // Thus, we have found a solution.
           num_goals++;
-          if (print)
+          if (print >= PRINT_ALL)
             board_print (bufs.grid);
         }
       // The remaining cases are
@@ -355,7 +433,7 @@ static int solve_tree (int unknown_num, int mine_count, int thread_num,
                && (mine_target == -1 || mine_count == mine_target))
         {
           num_goals++;
-          if (print)
+          if (print >= PRINT_ALL)
             board_print (bufs.grid);
         }
     }
@@ -567,7 +645,8 @@ static void parse_input (char *file)
       fprintf (stderr, "NCOLS too big for input buffer.\n");
       exit (1);
     }
-  printf ("Dimensions: %d, %d\n", nrows, ncols);
+  if (print >= PRINT_BASIC)
+    printf ("Dimensions: %d, %d\n", nrows, ncols);
 
   // Add buffer to dimensions.
   nrows += 2;
@@ -618,7 +697,7 @@ static void parse_input (char *file)
       grid[i][ncols-1] = MINE_OFF;
     }
 
-  if (print)
+  if (print >= PRINT_BASIC)
     board_print (grid);
 }
 
@@ -630,11 +709,14 @@ Minesweeper solver. Written by Chen Guo.\n\
 Usage:\n\
   ms_solve [OPTION]... [FILE]\n\n\
 Options:\n\
-  -a  Find all solutions.\n\
-  -b  Brute force algorithm.\n\
-  -h  Print this help message.\n\
-  -m  Set a target number of mines.\n\
-  -o  Optimized algorithm.\n\
-  -p  Print solutions.\n\
-  -t  Threads to use.\n\n");
+  -a                Find all solutions.\n\
+  -h                Print this help message.\n\
+  -m MINE_TARGET    Set a target number of mines.\n\
+  -p PRINT          Print solutions.\n\
+                      0    Print nothing.\n\
+                      1    Print time elapsed.\n\
+                      2    Print basic information.\n\
+                      3    Print found solutions.\n\
+  -r                Pre-resolve unknowns.\n\
+  -t THREADS        Number of threads to use.\n\n");
 }
