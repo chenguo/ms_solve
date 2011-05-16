@@ -69,7 +69,7 @@ static int total_unknowns;       // Total possible mine positions.
 static int goal_states = 0;      // Total goal states found, with constraints.
 static bool print = false;       // Print boards.
 static bool single = true;       // Find all solutions (opposed to just one)
-static int mine_target = -1;        // Number of desired mines in solution.
+static int mine_target = -1;     // Number of desired mines in solution.
 
 /* For thread control */
 static int max_threads = 1;      // Threads to use.
@@ -80,6 +80,7 @@ static pthread_cond_t *thr_cond; // Thread control cond var.
 
 /* Function prototypes. */
 static void optimize_grid ();
+static void preprocess_grid ();
 static void * solve_tree_thr (void *);
 static int solve_tree (int, int, int, struct buffers);
 static bool consistency_check (struct ind, int **grid);
@@ -161,9 +162,12 @@ int main (int argc, char **argv)
   struct timeval timer_start;
   gettimeofday (&timer_start, NULL);
 
-  // If not brutefoce, optimize board first.
+  // If not bruteforce, optimize board first.
   if (!brute)
     optimize_grid ();
+
+  // Preprocess the grid to prepare for search.
+  preprocess_grid ();
 
   total_unknowns =
     find_unknowns (thr_data[0].bufs.grid, thr_data[0].bufs.ind);
@@ -204,6 +208,24 @@ int main (int argc, char **argv)
    search. Essentially, this will reduce the depth of the search tree. */
 static void optimize_grid ()
 {}
+
+/* This function counts the number of current existing mines on the field,
+   and adjusts the MINE_TARGET field accordingly. */
+static void preprocess_grid ()
+{
+  // If no MINE_TARGET was set, there is no need to adjust it.
+  if (mine_target == -1)
+    return;
+
+  int i, j;
+  int **grid = thr_data[0].bufs.grid;
+  for (i = 1; i < nrows - 1; i++)
+    for (j = 1; j < nrows - 1; j++)
+      if (grid[i][j] == MINE_ON)
+        mine_target--;
+  //fprintf (stderr, "Adjusted MINE_TARGET: %d\n", mine_target);
+}
+
 
 /* Threaded function call for solve_tree. */
 static void * solve_tree_thr (void *data)
