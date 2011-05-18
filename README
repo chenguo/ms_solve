@@ -4,3 +4,17 @@
   The minesweeper consistency problem is stated as follows:
   Given a ROWSxCOLS minesweeper grid of some exposed tiles numbering the mines
 surrounding them, does there exist a valid placement of n mines?
+
+*******************************************************************************
+  TODO
+*******************************************************************************
+
+1. Order unknowns: Order unknowns by how constrained they are, and assign
+   values to the most constrained ones first. This allows for more pruning at
+   the top of the search tree.
+
+2. Derive values: Once an UNKNOWN is assigned to ON or OFF, other unknowns may
+   now only have one legal value. Force the assignment of that value.
+
+3. Likely value: In case both ON and OFF are valid, attempt to judge what is
+   the most likely value, and assign that one first.
