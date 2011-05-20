@@ -55,6 +55,13 @@ struct thr_args
   int mine_count;             // Number of mines turned on thus far.
 };
 
+/* Struct used for sorting unknown tiles. */
+struct sort_tile
+{
+  struct ind index;           // Index of unknown tile.
+  int number_tiles;           // Number of surrounding tiles with numbers.
+};
+
 /*****************************************************************************
  *
  *  Globals
@@ -69,6 +76,7 @@ static int total_unknowns;       // Total possible mine positions.
 static int goal_states = 0;      // Total goal states found, with constraints.
 static bool preresolve = false;  // Preresolve uknowns before search.
 static bool single = true;       // Find all solutions (opposed to just one)
+static bool sort = false;        // Sort unknown order.
 static int mine_target = -1;     // Number of desired mines in solution.
 enum { PRINT_NONE, PRINT_MIN, PRINT_BASIC, PRINT_ALL };
 static int print = PRINT_BASIC;   // Print boards.
@@ -81,7 +89,6 @@ static pthread_mutex_t *thr_lock;    // Thread control mutex.
 static pthread_cond_t *thr_cond; // Thread control cond var.
 
 /* Function prototypes. */
-static int preresolve_grid ();
 static void preprocess_grid ();
 static void * solve_tree_thr (void *);
 static int solve_tree (int, int, int, struct buffers);
@@ -104,7 +111,7 @@ int main (int argc, char **argv)
 {
   // Parse arguments.
   char c;
-  while ((c = getopt (argc, argv, "ahm:op:rt:")) != -1)
+  while ((c = getopt (argc, argv, "ahm:p:rst:")) != -1)
     {
       switch (c)
         {
@@ -132,6 +139,11 @@ int main (int argc, char **argv)
           preresolve = true;
           break;
 
+          // Sort unknowns by number of surrounding tiles.
+        case 's':
+          sort = true;
+          break;
+
           // Threads tp use.
         case 't':
           max_threads = atoi(optarg);
@@ -157,20 +169,9 @@ int main (int argc, char **argv)
   struct timeval timer_start;
   gettimeofday (&timer_start, NULL);
 
-  // If not bruteforce, optimize board first.
-  int resolved = 0;
-  if (preresolve)
-    resolved = preresolve_grid ();
-  if (print >= PRINT_MIN)
-    printf ("Pre-resolved unknowns: %d\n", resolved);
-  if (print >= PRINT_BASIC && preresolve)
-    board_print (thr_data[0].bufs.grid);
-
-  // Preprocess the grid to prepare for search.
+  // Preprocess the grid to prepare for search. Assigns global value
+  // TOTAL_UNKNOWNS.
   preprocess_grid ();
-
-  total_unknowns =
-    find_unknowns (thr_data[0].bufs.grid, thr_data[0].bufs.ind);
 
   if (total_unknowns > 0)
     {
@@ -288,20 +289,113 @@ static int preresolve_grid ()
   return resolved;
 }
 
-/* This function counts the number of current existing mines on the field,
-   and adjusts the MINE_TARGET field accordingly. */
-static void preprocess_grid ()
+/* Find the unknowns in the grid, and establish the indices. */
+static int find_unknowns (int **grid, struct ind *ind)
 {
-  // If no MINE_TARGET was set, there is no need to adjust it.
-  if (mine_target == -1)
-    return;
-
-  int i, j;
-  int **grid = thr_data[0].bufs.grid;
+  int i, j, n = 0;
   for (i = 1; i < nrows - 1; i++)
     for (j = 1; j < ncols - 1; j++)
-      if (grid[i][j] == MINE_ON)
-        mine_target--;
+      {
+        if (grid[i][j] == UNKNOWN)
+          {
+            ind[n].row = i;
+            ind[n++].col = j;
+            //fprintf (stderr, "UNKNOWN at [%d][%d]\n", i, j);
+          }
+      }
+  ind[n].row = -1;
+  ind[n].col = -1;
+  return n;
+}
+
+/* Comparator function to pass to qsort (), when sorting unknown tiles. */
+int comp_tiles (const void *arg1, const void *arg2)
+{
+  struct sort_tile *a = (struct sort_tile *) arg1;
+  struct sort_tile *b = (struct sort_tile *) arg2;
+
+  // Compare the NUMBER_TILES field.
+  if (a->number_tiles > b->number_tiles)
+    return -1;
+  else if (a->number_tiles < b->number_tiles)
+    return 1;
+  else
+    return 0;
+}
+
+/* Sort the unknown tiles by constraint order. The unknowns with more
+   surrounding numbered tiles will come first, and thus be searched first. */
+static void sort_unknowns (int **grid, struct ind *ind)
+{
+  struct sort_tile *unknown_tiles =
+    (struct sort_tile *) malloc (total_unknowns * sizeof *unknown_tiles);
+
+  // Count the number of mines around each unknown tile.
+  int i;
+  for (i = 0; i < total_unknowns; i++)
+    {
+      unknown_tiles[i].index = ind[i];
+      int number_tiles = 0;
+      int row = ind[i].row;
+      int col = ind[i].col;
+      int j, k;
+      for (j = -1; j < 2; j++)
+        for (k = -1; k < 2; k++)
+          {
+            int tile_val = grid[row+j][col+k] + TILE_ADJUST;
+            if (0 <= tile_val && tile_val <= 8)
+              number_tiles++;
+          }
+      unknown_tiles[i].number_tiles = number_tiles;
+    }
+
+  // Sort the unknown tiles.
+  qsort (unknown_tiles, total_unknowns,
+         sizeof (struct sort_tile), comp_tiles);
+
+  // Copy sorted results back into IND.
+  for (i = 0; i < total_unknowns; i++)
+    ind[i] = unknown_tiles[i].index;
+}
+
+/* This function counts the number of current existing mines on the field,
+   and adjusts the MINE_TARGET field accordingly.
+
+   This function calls a few functions that scan through the unknown tiles,
+   and these functions can be combined, but that is neglected because the
+   small time spend iterating through the grid is negligible compared to the
+   exponential time needed to solve the consistency problem.
+ */
+static void preprocess_grid ()
+{
+  int **grid = thr_data[0].bufs.grid;
+  struct ind *ind = thr_data[0].bufs.ind;
+
+  // Preprocess grid, if specified.
+  int resolved = 0;
+  if (preresolve)
+    resolved = preresolve_grid ();
+  if (print >= PRINT_MIN)
+    printf ("Pre-resolved unknowns: %d\n", resolved);
+  if (print >= PRINT_BASIC && preresolve)
+    board_print (thr_data[0].bufs.grid);
+
+  // If no MINE_TARGET was set, there is no need to adjust it.
+  if (mine_target > -1)
+    {
+      int i, j;
+      for (i = 1; i < nrows - 1; i++)
+        for (j = 1; j < ncols - 1; j++)
+          if (grid[i][j] == MINE_ON)
+            mine_target--;
+    }
+
+  // Find all the unknowns.
+  total_unknowns = find_unknowns (grid, ind);
+
+  // Sort the unknowns (by surrounding tiles) if specified.
+  if (sort)
+    sort_unknowns (grid, ind);
 }
 
 
@@ -491,25 +585,6 @@ static bool consistency_check (struct ind index, int **grid)
           }
       }
   return true;
-}
-
-/* Find the unknowns in the grid, and establish the indices. */
-static int find_unknowns (int **grid, struct ind *ind)
-{
-  int i, j, n = 0;
-  for (i = 1; i < nrows - 1; i++)
-    for (j = 1; j < ncols - 1; j++)
-      {
-        if (grid[i][j] == UNKNOWN)
-          {
-            ind[n].row = i;
-            ind[n++].col = j;
-            //fprintf (stderr, "UNKNOWN at [%d][%d]\n", i, j);
-          }
-      }
-  ind[n].row = -1;
-  ind[n].col = -1;
-  return n;
 }
 
 /* Set mines to UNKNOWN from I onwards. */

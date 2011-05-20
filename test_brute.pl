@@ -8,30 +8,32 @@ sub run_test;
 if (@ARGV > 0 && $ARGV[0] =~ /all/) {
     print "RUNNING ALL TESTS\n\n";
     print "Base case:\n";
-    #run_test ("-t 1");
+    run_test ("-t 1 -p 1");
     print "\n\n";
 
     print "Pre-resolve:\n";
-    #run_test ("-r -t 1");
+    run_test ("-r -t 1 -p 1");
     print "\n\n";
 
     print "2 threads\n";
-    run_test ("-t 2");
+    run_test ("-t 2 -p 1");
     print "\n\n";
 
     print "4 threads\n";
-    run_test ("-t 4");
+    run_test ("-t 4 -p 1");
     print "\n\n";
 
     print "8 threads\n";
-    run_test ("-t 8");
+    run_test ("-t 8 -p 1");
     print "\n\n";
 
     print "All Optimizations\n";
-    run_test ("-r -t 8");
+    run_test ("-r -t 8 -p 1");
     print "\n\n";
 } else {
-    run_test ("-t 2");
+    my $arg = join (" ", @ARGV);
+    print "Running with arguments: $arg -m $mines\n";
+    run_test ($arg);
 }
 
 sub run_test () {
