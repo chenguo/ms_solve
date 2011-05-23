@@ -89,12 +89,16 @@ static int avail_threads = 1;    // Available threads.
 static struct search *thr_data;  // Array of search data, for threads.
 static pthread_mutex_t *thr_lock;    // Thread control mutex.
 static pthread_cond_t *thr_cond; // Thread control cond var.
+__thread thread_num;             // Thread number.
 
 /* Function prototypes. */
-/* Grid solver functions. */
+/* Preprocess functions. */
 static void preprocess_grid ();
+
+/* Grid solver functions. */
 static void * solve_tree_thr (void *);
-static int solve_tree (int, int, int, struct buffers);
+static int solve_tree (int, int, struct buffers);
+static int solve_subtree (int, int, struct buffers, bool, bool);
 static bool consistency_check (struct ind, int **grid);
 static int find_unknowns (int **, struct ind *);
 static void clear_unknowns (int, struct ind *, int **);
@@ -173,18 +177,14 @@ int main (int argc, char **argv)
   // Begin processing file. Start timer.
   struct timeval timer_start, timer_pre, timer_end;
   double total_time, pre_time, search_time;
-  gettimeofday (&timer_start, NULL);
+  if (print >= PRINT_MIN)
+    gettimeofday (&timer_start, NULL);
 
   // Preprocess the grid to prepare for search. Assigns global value
   // TOTAL_UNKNOWNS.
   preprocess_grid ();
   if (print >= PRINT_MIN)
-    {
-      gettimeofday (&timer_preproc, NULL);
-      pre_time = (timer_pre.tv_sec * 1000.0) + (timer_pre.tv_usec/1000.0)
-        - (timer_start.tv_sec * 1000.0) - (timer_start.tv_usec / 1000.0);
-      printf ("Preprocess time: %f ms\n", pre_time);
-    }
+    gettimeofday (&timer_pre, NULL);
 
   if (total_unknowns > 0)
     {
@@ -214,6 +214,10 @@ int main (int argc, char **argv)
     {
       gettimeofday (&timer_end, NULL);
 
+      pre_time = (timer_pre.tv_sec * 1000.0) + (timer_pre.tv_usec/1000.0)
+        - (timer_start.tv_sec * 1000.0) - (timer_start.tv_usec / 1000.0);
+      printf ("Preprocess time: %f ms\n", pre_time);
+
       search_time = (timer_end.tv_sec * 1000.0) + (timer_end.tv_usec/1000.0)
         - (timer_pre.tv_sec * 1000.0) - (timer_pre.tv_usec / 1000.0);
       printf ("Search time: %f ms\n", search_time);
@@ -232,7 +236,7 @@ int main (int argc, char **argv)
 
 /*****************************************************************************
  *
- *  Solver functions.
+ *  Preprocess functions.
  *
  ****************************************************************************/
 
@@ -378,14 +382,13 @@ static void sort_unknowns (int **grid, struct ind *ind)
     ind[i] = unknown_tiles[i].index;
 }
 
-/* This function counts the number of current existing mines on the field,
+/* Count the number of current existing mines on the field,
    and adjusts the MINE_TARGET field accordingly.
 
-   This function calls a few functions that scan through the unknown tiles,
-   and these functions can be combined, but that is neglected because the
-   small time spend iterating through the grid is negligible compared to the
-   exponential time needed to solve the consistency problem.
- */
+   This function also calls a few functions that scan through the unknown
+   tiles, and these functions can be combined, but that is neglected because
+   the small time spend iterating through the grid is negligible compared to
+   the exponential time needed to solve the consistency problem. */
 static void preprocess_grid ()
 {
   int **grid = thr_data[0].bufs.grid;
@@ -419,15 +422,21 @@ static void preprocess_grid ()
 }
 
 
+
+/*****************************************************************************
+ *
+ *  Solver functions.
+ *
+ ****************************************************************************/
+
 /* Threaded function call for solve_tree. */
 static void * solve_tree_thr (void *data)
 {
   struct thr_args *args = (struct thr_args *) data;
-  int thread_num = args->thread_num;
+  thread_num = args->thread_num;
   struct buffers bufs = thr_data[thread_num].bufs;
 
-  int num_goals = solve_tree (args->unknown_num, args->mine_count,
-                              thread_num, bufs);
+  int num_goals = solve_tree (args->unknown_num, args->mine_count, bufs);
 
   // Critical section.
   // 1) Update goals found.
@@ -451,107 +460,131 @@ static void * solve_tree_thr (void *data)
    This algorithm is based on Neville Mehta's, ported from Lisp to C++ by
    Meredith Kadlac, but is much more optimized and performs more than 20x
    faster. */
-static int solve_tree (int unknown_num, int mine_count, int thread_num,
-                       struct buffers bufs)
+static int solve_tree (int unknown_num, int mine_count, struct buffers bufs)
 {
-  int row = bufs.ind[unknown_num].row;
-  int col = bufs.ind[unknown_num].col;
-  bool consis;
   int num_goals = 0;
 
-  // Keep mine off. Check for consistency.
-  bufs.grid[row][col] = MINE_OFF;
-  consis = consistency_check (bufs.ind[unknown_num], bufs.grid);
+  // If all mines are used up, just check the MINE_OFF subtree. Also, do not
+  // thread.
+  if (mine_count == mine_target)
+    num_goals = solve_subtree (unknown_num, mine_count, bufs, false, false);
+  else
+    {
+      // Check both subtrees. For the first subtree, instruct it to spin off a
+      // thread if a thread is available.
+
+      // Determine which subtree to check first.
+      bool mine_on = false;
+
+      num_goals = solve_subtree (unknown_num, mine_count, bufs,
+                                 mine_on, true);
+
+      // If only a single solution is desired, and it's been found,
+      // then we're done.
+      if (single && num_goals)
+        return num_goals;
+
+      // Check the other subtree, this time instructing it to not thread.
+      clear_unknowns (unknown_num + 1, bufs.ind, bufs.grid);
+      num_goals += solve_subtree (unknown_num, mine_count, bufs,
+                                  !mine_on, false);
+    }
+  return num_goals;
+}
+
+/* */
+static int solve_subtree (int unknown_num, int mine_count, struct buffers bufs,
+                          bool mine_on, bool create_thread)
+{
+  int num_goals = 0;
+  int row = bufs.ind[unknown_num].row;
+  int col = bufs.ind[unknown_num].col;
+
+  // Toggle the unknown to be MINE_ON or MINE_OFF.
+  if (mine_on)
+    {
+      bufs.grid[row][col] = MINE_ON;
+      mine_count++;
+    }
+  else
+    bufs.grid[row][col] = MINE_OFF;
+
+  bool consis = consistency_check (bufs.ind[unknown_num], bufs.grid);
   if (consis)
     {
-      // The MINE_OFF state for this mine is valid.
+      // The mine state is valid. Check for subtrees, or if this branch of
+      // the search tree is exhausted.
       if (unknown_num < total_unknowns - 1
           && (mine_target == -1 || mine_count <= mine_target))
         {
-          // A subtree exists, and if MINE_TARGET is specified, we have
-          // not exceeded it. Check subtree for valid solutions.
-          // If a thread is available, perform this in a separate thread.
-          bool create_thread = false;
-          if (avail_threads && (mine_count != mine_target)
-              && (total_unknowns - unknown_num > 3))
+          // A subtree exists:
+          // 1) Not all unknowns are assigned.
+          // 2) If MINE_TARGET is specified, it has not been exceeded.
+
+          // Check if we should create a new thread.
+          if (create_thread && avail_threads
+              && (mine_target == -1 || mine_count < mine_target)
+              && (total_unknowns - unknown_num > 4))
             {
               LOCK;
-              // Check again after locking. In the time between checking for
-              // an available thread and locking, someone could have taken it.
-              if (avail_threads)
-                create_thread = true;
+              // Check again after locking. In the time between the IF
+              // statement and locking, AVAIL_THREADS could have changed.
+              if (!avail_threads)
+                {
+                  UNLOCK;
+                  create_thread = false;
+                }
               else
-                UNLOCK;
-            }
-          if (create_thread)
-            {
-              // Find a thread, and copy our thread's buffers into it.
-              int new_thr = thread_find ();
-              thr_data[new_thr].avail = false;
-              avail_threads--;
-              UNLOCK;
+                {
+                  // Find a thread and claim it.
+                  int new_thr = thread_find (0);
+                  thr_data[new_thr].avail = false;
+                  avail_threads--;
+                  UNLOCK;
 
-              thread_copy (new_thr, thread_num);
-              struct thr_args *args = (struct thr_args *) malloc (sizeof *args);
-              args->thread_num = new_thr;
-              args->unknown_num = unknown_num + 1;
-              args->mine_count = mine_count;
-              pthread_t thread;
-              pthread_create (&thread, NULL, solve_tree_thr, args);
-              pthread_detach (thread);
+                  // Copy buffers into new thread.
+                  thread_copy (new_thr, thread_num);
+                  struct thr_args *args =
+                    (struct thr_args *) malloc (sizeof *args);
+                  args->thread_num = new_thr;
+                  args->unknown_num = unknown_num + 1;
+                  args->mine_count = mine_count;
+                  pthread_create (&thr_data[new_thr].thread, NULL,
+                                  solve_tree_thr, args);
+                  pthread_detach (thr_data[new_thr].thread);
+                }
             }
           else
+            create_thread = false;
+          if (!create_thread)
             {
-              num_goals = solve_tree (unknown_num + 1, mine_count,
-                                      thread_num, bufs);
+              //fprintf (stderr, "Rec call\n");
+              num_goals = solve_tree (unknown_num + 1, mine_count, bufs);
             }
         }
       else if (unknown_num == total_unknowns - 1
                && (mine_target == -1 || mine_count == mine_target))
         {
+          // Solution has been found:
           // 1) All unknowns have been assigned a valid state.
-          // 2) MINE_TARGET wasn't specified, or it has been reached.
-          // Thus, we have found a solution.
+          // 2) MINE_TARGET, if specified, has been matched.
           num_goals++;
           if (print >= PRINT_ALL)
             board_print (bufs.grid);
         }
-      // The remaining cases are
-      // 1) MINE_TARGET is specified and exceeded
-      // 2) MINE_TARGET is specified and not reached, but unknown tiles have
-      //    all been assigned.
-      // In both of these cases, no solution is found. NUM_GOALS remains 0.
+      else
+        {
+          // The remaining case is that all unknown tiles have been assigned,
+          // and MINE_TARGET was specified but not reached. Here, there is
+          // nothing to be done.
+        }
     }
-
-  // Turn mine on. This case is invalid if:
-  // 1) SINGLE is set and a goal state has been found.
-  // 2) MINE_TARGET is set and has been reached.
-  if (single && num_goals || (mine_target >= 0 && mine_count == mine_target))
-    return num_goals;
-
-  // Turn mine on. Check for consistency.
-  clear_unknowns (unknown_num + 1, bufs.ind, bufs.grid);
-  bufs.grid[row][col] = MINE_ON;
-  consis = consistency_check (bufs.ind[unknown_num], bufs.grid);
-  if (consis)
+  else
     {
-      // The MINE_ON state for this mine is valid.
-      mine_count++;
+      //fprintf (stderr, "[%d][%d] inconsis\n", row, col);
+      //board_print (bufs.grid);
 
-      if (unknown_num < total_unknowns -1
-          && (mine_target == -1 || mine_count <= mine_target))
-        {
-          num_goals += solve_tree (unknown_num + 1, mine_count, thread_num, bufs);
-        }
-      else if (unknown_num == total_unknowns - 1
-               && (mine_target == -1 || mine_count == mine_target))
-        {
-          num_goals++;
-          if (print >= PRINT_ALL)
-            board_print (bufs.grid);
-        }
     }
-
   return num_goals;
 }
 
