@@ -74,6 +74,8 @@ static int ncols;
 static int ntiles;
 static int total_unknowns;       // Total possible mine positions.
 static int goal_states = 0;      // Total goal states found, with constraints.
+
+/* Argument settings. */
 static bool preresolve = false;  // Preresolve uknowns before search.
 static bool single = true;       // Find all solutions (opposed to just one)
 static bool sort = false;        // Sort unknown order.
@@ -89,6 +91,7 @@ static pthread_mutex_t *thr_lock;    // Thread control mutex.
 static pthread_cond_t *thr_cond; // Thread control cond var.
 
 /* Function prototypes. */
+/* Grid solver functions. */
 static void preprocess_grid ();
 static void * solve_tree_thr (void *);
 static int solve_tree (int, int, int, struct buffers);
@@ -96,12 +99,14 @@ static bool consistency_check (struct ind, int **grid);
 static int find_unknowns (int **, struct ind *);
 static void clear_unknowns (int, struct ind *, int **);
 
+/* Thread control functions. */
 static void thread_alloc ();
 static void thread_struct_alloc ();
 static int thread_find ();
 static void thread_free ();
 static void thread_copy (int, int);
 
+/* I/O functions. */
 static void board_print (int **);
 static void parse_input (char *);
 static void help ();
@@ -166,12 +171,20 @@ int main (int argc, char **argv)
   parse_input (file);
 
   // Begin processing file. Start timer.
-  struct timeval timer_start;
+  struct timeval timer_start, timer_pre, timer_end;
+  double total_time, pre_time, search_time;
   gettimeofday (&timer_start, NULL);
 
   // Preprocess the grid to prepare for search. Assigns global value
   // TOTAL_UNKNOWNS.
   preprocess_grid ();
+  if (print >= PRINT_MIN)
+    {
+      gettimeofday (&timer_preproc, NULL);
+      pre_time = (timer_pre.tv_sec * 1000.0) + (timer_pre.tv_usec/1000.0)
+        - (timer_start.tv_sec * 1000.0) - (timer_start.tv_usec / 1000.0);
+      printf ("Preprocess time: %f ms\n", pre_time);
+    }
 
   if (total_unknowns > 0)
     {
@@ -197,12 +210,19 @@ int main (int argc, char **argv)
     printf ("Number of goal states: %d\n", goal_states);
 
   // Find elapsed time in us.
-  struct timeval timer_end;
-  gettimeofday (&timer_end, NULL);
-  double msec = (timer_end.tv_sec * 1000.0) + (timer_end.tv_usec/1000.0)
-    - (timer_start.tv_sec * 1000.0) - (timer_start.tv_usec / 1000.0);
   if (print >= PRINT_MIN)
-    printf ("Time elapsed: %f ms\n", msec);
+    {
+      gettimeofday (&timer_end, NULL);
+
+      search_time = (timer_end.tv_sec * 1000.0) + (timer_end.tv_usec/1000.0)
+        - (timer_pre.tv_sec * 1000.0) - (timer_pre.tv_usec / 1000.0);
+      printf ("Search time: %f ms\n", search_time);
+
+
+      total_time = (timer_end.tv_sec * 1000.0) + (timer_end.tv_usec/1000.0)
+        - (timer_start.tv_sec * 1000.0) - (timer_start.tv_usec / 1000.0);
+      printf ("Elapsed time: %f ms\n", total_time);
+    }
 
   // Free thread resources.
   thread_free ();
