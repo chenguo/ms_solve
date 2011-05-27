@@ -11,10 +11,15 @@
 
 /* Defines. */
 #define INBUF_SIZ 1024
-#define TILE_ADJUST ('0' * -1)
-#define UNKNOWN '?'
-#define MINE_ON '*'
-#define MINE_OFF '-'
+#define TILE_ZERO 1000000
+#define TILE_MAP(val) (val - '0')  // Numbered tiles are mapped to
+#define TILE_UNMAP(val) (val + '0')      // 1000000 - 1000008
+#define UNKNOWN 9
+#define MINE_ON 10
+#define MINE_OFF -10
+#define UNKNOWN_CHAR '?'
+#define MINE_ON_CHAR '*'
+#define MINE_OFF_CHAR '-'
 #define LOCK {pthread_mutex_lock (thr_lock);}
 #define UNLOCK {pthread_mutex_unlock (thr_lock);}
 
@@ -76,11 +81,12 @@ static int total_unknowns;       // Total possible mine positions.
 static int goal_states = 0;      // Total goal states found, with constraints.
 
 /* Argument settings. */
+static bool force = false;       // Force unknown states during search.
 static bool preresolve = false;  // Preresolve uknowns before search.
 static bool single = true;       // Find all solutions (opposed to just one)
 static bool sort = false;        // Sort unknown order.
 static int mine_target = -1;     // Number of desired mines in solution.
-enum { PRINT_NONE, PRINT_MIN, PRINT_BASIC, PRINT_ALL };
+enum { PRINT_NONE, PRINT_MIN, PRINT_BASIC, PRINT_ALL, PRINT_DEBUG };
 static int print = PRINT_BASIC;   // Print boards.
 
 /* For thread control */
@@ -89,7 +95,7 @@ static int avail_threads = 1;    // Available threads.
 static struct search *thr_data;  // Array of search data, for threads.
 static pthread_mutex_t *thr_lock;    // Thread control mutex.
 static pthread_cond_t *thr_cond; // Thread control cond var.
-__thread thread_num;             // Thread number.
+static __thread int thread_num;  // Thread number.
 
 /* Function prototypes. */
 /* Preprocess functions. */
@@ -98,8 +104,8 @@ static void preprocess_grid ();
 /* Grid solver functions. */
 static void * solve_tree_thr (void *);
 static int solve_tree (int, int, struct buffers);
-static int solve_subtree (int, int, struct buffers, bool, bool);
-static bool consistency_check (struct ind, int **grid);
+static int solve_subtree (int, int, struct buffers, bool);
+static bool consistency_check (struct ind, int **, int);
 static int find_unknowns (int **, struct ind *);
 static void clear_unknowns (int, struct ind *, int **);
 
@@ -110,7 +116,11 @@ static int thread_find ();
 static void thread_free ();
 static void thread_copy (int, int);
 
-/* I/O functions. */
+/* Misc functions. */
+static inline int force_on (int);
+static inline int force_off (int);
+static inline bool is_mine (int);
+static inline int mine_src (int);
 static void board_print (int **);
 static void parse_input (char *);
 static void help ();
@@ -120,13 +130,18 @@ int main (int argc, char **argv)
 {
   // Parse arguments.
   char c;
-  while ((c = getopt (argc, argv, "ahm:p:rst:")) != -1)
+  while ((c = getopt (argc, argv, "afhm:p:rst:")) != -1)
     {
       switch (c)
         {
           // Find all solutions.
         case 'a':
           single = false;
+          break;
+
+          // Force unknown state during search.
+        case 'f':
+          force = true;
           break;
 
           // Help. Does not return.
@@ -186,7 +201,11 @@ int main (int argc, char **argv)
   if (print >= PRINT_MIN)
     gettimeofday (&timer_pre, NULL);
 
-  if (total_unknowns > 0)
+  // NOTE: in defines, mapping tile values to 1000000 - 1000008 assumes that
+  // there will NEVER be more than 1 million unknowns.
+  if (total_unknowns >= 1000000)
+    fprintf (stderr, "Too many unknowns, search not performed.\n");
+  else if (total_unknowns > 0)
     {
       // Attempt to find a solution, or multiple solutions.
       // Spin off search thread in thread 0, and wait.
@@ -229,7 +248,7 @@ int main (int argc, char **argv)
     }
 
   // Free thread resources.
-  thread_free ();
+  //thread_free ();
 }
 
 
@@ -243,8 +262,10 @@ int main (int argc, char **argv)
 /* Given a tile, if it is a numbered tile, count the mines and unknowns around
    it. If the count matches the tile number, then all unknowns around must be
    mines. Conversely, if the count matches the mine number, then all unknowns
-   must be off. */
-static int resolve_tile (int row, int col, int **grid)
+   must be off.
+   SOURCE denotes the index of the unknown tile that this resolution stems
+   from. */
+static int resolve_tile (int row, int col, int **grid, int source, bool rec)
 {
 
   struct ind ind[8];
@@ -253,7 +274,7 @@ static int resolve_tile (int row, int col, int **grid)
   int resolved = 0;
   int i, j;
 
-  int tile_num = grid[row][col] + TILE_ADJUST;
+  int tile_num = grid[row][col];
   if (tile_num < 0 || tile_num > 8)
     return 0;
 
@@ -266,7 +287,7 @@ static int resolve_tile (int row, int col, int **grid)
             ind[unknowns].row = row + i;
             ind[unknowns++].col = col + j;
           }
-        else if (grid[row+i][col+j] == MINE_ON)
+        else if (is_mine (grid[row+i][col+j]))
           mines++;
       }
 
@@ -276,27 +297,49 @@ static int resolve_tile (int row, int col, int **grid)
   // unknowns.
   bool turn_on;
   if (tile_num == mines + unknowns)
-    turn_on = true;
+    {
+      turn_on = true;
+      int k;
+      for (k = 0; k < unknowns; k++)
+        {
+          if (print >= PRINT_DEBUG)
+            fprintf (stderr, "[%d][%d] forced on\n", ind[k].row, ind[k].col);
+          grid[ind[k].row][ind[k].col] = force_on (source);
+        }
+    }
   else if (tile_num == mines)
-    turn_on = false;
+    {
+      turn_on = false;
+      int k;
+      for (k = 0; k < unknowns; k++)
+        {
+          if (print >= PRINT_DEBUG)
+            fprintf (stderr, "[%d][%d] forced off\n", ind[k].row, ind[k].col);
+          grid[ind[k].row][ind[k].col] = force_off (source);
+        }
+    }
   else
     return 0;
 
   resolved = unknowns;
+  return resolved;
 
-  int k;
-  for (k = 0; k < unknowns; k++)
-    grid[ind[k].row][ind[k].col] = (turn_on)? MINE_ON : MINE_OFF;
-
-  for (k = 0; k < unknowns; k++)
+  // Check for recursive mode.
+  // TODO: control direction of frontier in recursion, for effcieny (i.e. don't
+  // recheck what your parent just checked. */
+  if (rec)
     {
-      row = ind[k].row;
-      col = ind[k].col;
-      for (i = -1; i < 2; i++)
-        for (j = -1; j < 2; j++)
-          resolved += resolve_tile (row + i, col + j, grid);
+      // For each unknown that was resolved, check it's neighbors.
+      int k;
+      for (k = 0; k < unknowns; k++)
+        {
+          row = ind[k].row;
+          col = ind[k].col;
+          for (i = -1; i < 2; i++)
+            for (j = -1; j < 2; j++)
+              resolved += resolve_tile (row + i, col + j, grid, source, rec);
+        }
     }
-
   return resolved;
 }
 
@@ -309,7 +352,7 @@ static int preresolve_grid ()
   int **grid = thr_data[0].bufs.grid;
   for (i = 1; i < nrows - 1; i++)
     for (j = 1; j < ncols - 1; j++)
-      resolved += resolve_tile (i, j, grid);
+      resolved += resolve_tile (i, j, grid, -1, false);
   return resolved;
 }
 
@@ -324,7 +367,7 @@ static int find_unknowns (int **grid, struct ind *ind)
           {
             ind[n].row = i;
             ind[n++].col = j;
-            //fprintf (stderr, "UNKNOWN at [%d][%d]\n", i, j);
+            //rintf (stderr, "UNKNOWN at [%d][%d]\n", i, j);
           }
       }
   ind[n].row = -1;
@@ -366,8 +409,8 @@ static void sort_unknowns (int **grid, struct ind *ind)
       for (j = -1; j < 2; j++)
         for (k = -1; k < 2; k++)
           {
-            int tile_val = grid[row+j][col+k] + TILE_ADJUST;
-            if (0 <= tile_val && tile_val <= 8)
+            int tile_num = grid[row+j][col+k];
+            if (0 <= tile_num && tile_num <= 8)
               number_tiles++;
           }
       unknown_tiles[i].number_tiles = number_tiles;
@@ -409,7 +452,7 @@ static void preprocess_grid ()
       int i, j;
       for (i = 1; i < nrows - 1; i++)
         for (j = 1; j < ncols - 1; j++)
-          if (grid[i][j] == MINE_ON)
+          if (is_mine (grid[i][j]))
             mine_target--;
     }
 
@@ -434,6 +477,7 @@ static void * solve_tree_thr (void *data)
 {
   struct thr_args *args = (struct thr_args *) data;
   thread_num = args->thread_num;
+  int tmp = args->thread_num;
   struct buffers bufs = thr_data[thread_num].bufs;
 
   int num_goals = solve_tree (args->unknown_num, args->mine_count, bufs);
@@ -445,7 +489,7 @@ static void * solve_tree_thr (void *data)
   bool signal = false;
   LOCK;
   goal_states += num_goals;
-  thr_data[thread_num].avail = true;
+  thr_data[tmp].avail = true;
   avail_threads++;
   if (avail_threads == max_threads || (single && num_goals))
     pthread_cond_signal (thr_cond);
@@ -463,12 +507,31 @@ static void * solve_tree_thr (void *data)
 static int solve_tree (int unknown_num, int mine_count, struct buffers bufs)
 {
   int num_goals = 0;
+  int row = bufs.ind[unknown_num].row;
+  int col = bufs.ind[unknown_num].col;
 
-  // If all mines are used up, just check the MINE_OFF subtree. Also, do not
-  // thread.
-  if (mine_count == mine_target)
-    num_goals = solve_subtree (unknown_num, mine_count, bufs, false, false);
-  else
+  if (mine_src (bufs.grid[row][col]) >= 0)
+    {
+      // Unknown was pre-assigned. Just move on to next unknown.
+      if (is_mine (bufs.grid[row][col]))
+        mine_count++;
+      if (unknown_num == total_unknowns - 1
+          && (mine_target == -1 || mine_count == mine_target))
+        {
+          num_goals++;
+          if (print >= PRINT_ALL)
+            board_print (bufs.grid);
+        }
+      else
+        num_goals = solve_tree (unknown_num+1, mine_count, bufs);
+    }
+  else if (mine_count == mine_target)
+    {
+      // All mines are used up, just check the MINE_OFF subtree. Do not thread.
+      bufs.grid[row][col] = force_off (unknown_num);
+      num_goals = solve_subtree (unknown_num, mine_count, bufs, false);
+    }
+  else if (mine_target == -1 || mine_count < mine_target)
     {
       // Check both subtrees. For the first subtree, instruct it to spin off a
       // thread if a thread is available.
@@ -476,40 +539,58 @@ static int solve_tree (int unknown_num, int mine_count, struct buffers bufs)
       // Determine which subtree to check first.
       bool mine_on = false;
 
-      num_goals = solve_subtree (unknown_num, mine_count, bufs,
-                                 mine_on, true);
+      // Check the first subtree. Thread if possible.
+      if (mine_on)
+        {
+          if (print >= PRINT_DEBUG)
+            fprintf (stderr, "[%d][%d] on\n", row, col);
+          bufs.grid[row][col] = force_on (unknown_num);
+          mine_count++;
+        }
+      else
+        {
+          if (print >= PRINT_DEBUG)
+            fprintf (stderr, "[%d][%d] off\n", row, col);
+          bufs.grid[row][col] = force_off (unknown_num);
+        }
+      num_goals = solve_subtree (unknown_num, mine_count, bufs, true);
 
       // If only a single solution is desired, and it's been found,
       // then we're done.
       if (single && num_goals)
         return num_goals;
 
-      // Check the other subtree, this time instructing it to not thread.
-      clear_unknowns (unknown_num + 1, bufs.ind, bufs.grid);
-      num_goals += solve_subtree (unknown_num, mine_count, bufs,
-                                  !mine_on, false);
+      // Check the other subtree. Do not thread.
+      mine_on = !mine_on;
+      if (mine_on)
+        {
+          if (print >= PRINT_DEBUG)
+            fprintf (stderr, "[%d][%d] on\n", row, col);
+          bufs.grid[row][col] = force_on (unknown_num);
+          mine_count++;
+        }
+      else
+        {
+          if (print >= PRINT_DEBUG)
+            fprintf (stderr, "[%d][%d] off\n", row, col);
+          bufs.grid[row][col] = force_off (unknown_num);
+        }
+      clear_unknowns (unknown_num, bufs.ind, bufs.grid);
+      num_goals += solve_subtree (unknown_num, mine_count, bufs, false);
     }
   return num_goals;
 }
 
 /* */
 static int solve_subtree (int unknown_num, int mine_count, struct buffers bufs,
-                          bool mine_on, bool create_thread)
+                          bool create_thread)
 {
   int num_goals = 0;
   int row = bufs.ind[unknown_num].row;
   int col = bufs.ind[unknown_num].col;
 
-  // Toggle the unknown to be MINE_ON or MINE_OFF.
-  if (mine_on)
-    {
-      bufs.grid[row][col] = MINE_ON;
-      mine_count++;
-    }
-  else
-    bufs.grid[row][col] = MINE_OFF;
-
-  bool consis = consistency_check (bufs.ind[unknown_num], bufs.grid);
+  bool consis = consistency_check (bufs.ind[unknown_num], bufs.grid,
+                                   unknown_num);
   if (consis)
     {
       // The mine state is valid. Check for subtrees, or if this branch of
@@ -522,14 +603,12 @@ static int solve_subtree (int unknown_num, int mine_count, struct buffers bufs,
           // 2) If MINE_TARGET is specified, it has not been exceeded.
 
           // Check if we should create a new thread.
-          if (create_thread && avail_threads
+          if (create_thread
               && (mine_target == -1 || mine_count < mine_target)
-              && (total_unknowns - unknown_num > 4))
+              && (total_unknowns - unknown_num > 10))
             {
               LOCK;
-              // Check again after locking. In the time between the IF
-              // statement and locking, AVAIL_THREADS could have changed.
-              if (!avail_threads)
+              if (avail_threads <= 0)
                 {
                   UNLOCK;
                   create_thread = false;
@@ -555,7 +634,9 @@ static int solve_subtree (int unknown_num, int mine_count, struct buffers bufs,
                 }
             }
           else
-            create_thread = false;
+            {
+              create_thread = false;
+            }
           if (!create_thread)
             {
               //fprintf (stderr, "Rec call\n");
@@ -581,7 +662,7 @@ static int solve_subtree (int unknown_num, int mine_count, struct buffers bufs,
     }
   else
     {
-      //fprintf (stderr, "[%d][%d] inconsis\n", row, col);
+      //fprintf (stderr, "[%d][%d] consis failed\n", row, col);
       //board_print (bufs.grid);
 
     }
@@ -598,10 +679,10 @@ static int solve_subtree (int unknown_num, int mine_count, struct buffers bufs,
    Q: unknown tiles surrounding tile.
    A tile is consistent if M <= N <= M + Q
 */
-static bool consistency_check (struct ind index, int **grid)
+static bool consistency_check (struct ind ind, int **grid, int unknown_num)
 {
-  int row = index.row;
-  int col = index.col;
+  int row = ind.row;
+  int col = ind.col;
   int i;
   int j;
 
@@ -610,7 +691,7 @@ static bool consistency_check (struct ind index, int **grid)
     for (j = -1; j < 2; j++)
       {
         // For each numbered tile around mine:
-        int tile_num = grid[row+i][col+j] + TILE_ADJUST;
+        int tile_num = grid[row+i][col+j];
         if (0 <= tile_num && tile_num <= 8)
           {
             int local_mines = 0;
@@ -618,11 +699,11 @@ static bool consistency_check (struct ind index, int **grid)
             int k;
             int l;
 
-            // Count number of mines and unknowns aroudn tile.
+            // Count number of mines and unknowns around tile.
             for (k = -1; k < 2; k++)
               for (l = -1; l < 2; l++)
                 {
-                  if (grid[row+i+k][col+j+l] == MINE_ON)
+                  if (is_mine (grid[row+i+k][col+j+l]))
                     local_mines++;
                   else if (grid[row+i+k][col+j+l] == UNKNOWN)
                     local_unknowns++;
@@ -634,17 +715,53 @@ static bool consistency_check (struct ind index, int **grid)
             // Perform the consistency check.
             if (tile_num < local_mines
                 || tile_num > local_mines + local_unknowns)
-              return false;
+              {
+                //fprintf (stderr, "[%d+%d][%d+%d] inconsis: tile %d  mines %d  unknowns %d\n",
+                //         row, i, col, j, tile_num, local_mines, local_unknowns);
+                board_print (grid);
+                return false;
+              }
+
+            // If specified, see if we can force neighboring mine states.
+            //if (force && (i == 1 || (i == 0 && j == 1)))
+            //  {
+            //    resolve_tile (row+i, col+j, grid, unknown_num, false);
+            //  }
           }
       }
+
+  if (force)
+    {
+      resolve_tile (row, col + 1, grid, unknown_num, false);
+      for (j = -1; j < 2; j++)
+        resolve_tile (row + 1, col + j, grid, unknown_num, false);
+    }
+
   return true;
 }
 
-/* Set mines to UNKNOWN from I onwards. */
+/* Set mines to UNKNOWN from the one after index I. However, if a mine is
+   forced by an unknown indexed earlier than I, don't touch it. */
 static inline void clear_unknowns (int i, struct ind *ind, int **grid)
 {
-  while (i < total_unknowns)
-    grid[ind[i].row][ind[i++].col] = UNKNOWN;
+  int init = i++;
+  if (!force)
+    {
+      while (i < total_unknowns)
+        grid[ind[i].row][ind[i++].col] = UNKNOWN;
+    }
+  else
+    {
+      while (i < total_unknowns)
+        {
+          int src = mine_src (grid[ind[i].row][ind[i].col]);
+          if (src >= init)
+            {
+              grid[ind[i].row][ind[i].col] = UNKNOWN;
+            }
+          i++;
+        }
+    }
 }
 
 
@@ -739,14 +856,57 @@ static void thread_copy (int cpy, int orig)
  *
  ****************************************************************************/
 
+/* When an unknown is forced on/off, use this function to set the value.
+   Later, we can determine which unknown forced this unknown to turn on/off. */
+static inline int force_on (int unknown_num)
+{
+  return unknown_num + MINE_ON + 1;
+}
+static inline int force_off (int unknown_num)
+{
+  return -force_on (unknown_num);
+}
+
+/* Check if a mapped tile value denotes if the mine is on. False is returned
+   otherwise. This function is not meant to be used when the tile being checked
+   is not a mine. */
+static inline bool is_mine (int tile_val)
+{
+  return (tile_val >= MINE_ON);
+}
+
+/* Returns the index of the unknown tile that forced this mine to be on or
+   off. -1 is returned if TILE_VAL denotes an unknown or a number, or if this
+   mine was forced to be on/off from the start. */
+static inline int mine_src (int tile_val)
+{
+  int n = abs (tile_val);
+  if (n <= MINE_ON)
+    return -1;
+  else
+    return (n - MINE_ON - 1);
+}
+
 /* Print the game board. */
 static void board_print (int **grid)
 {
   int i, j;
-  for (i = 0; i < nrows; i++)
+  for (i = 1; i < nrows - 1; i++)
     {
-      for (j = 0; j < ncols; j++)
-        printf ("%c", grid[i][j]);
+      for (j = 1; j < ncols - 1; j++)
+        {
+          char c;
+          if (0 <= grid[i][j] && grid[i][j] < UNKNOWN)
+            c = TILE_UNMAP(grid[i][j]);
+          else if (grid[i][j] == UNKNOWN)
+            c = UNKNOWN_CHAR;
+          else if (is_mine (grid[i][j]))
+            c = MINE_ON_CHAR;
+          else
+            c = MINE_OFF_CHAR;
+          printf ("%c", c);
+        }
+
       printf ("\n");
     }
   printf ("\n\n");
@@ -811,7 +971,26 @@ static void parse_input (char *file)
 
       // Copy to grid mapped to INT.
       for (j = 0; j < ncols-2; j++)
-        grid[i][j+1] = inbuf[j];
+        {
+          int grid_val;
+          switch (inbuf[j])
+            {
+            case UNKNOWN_CHAR:
+              grid_val = UNKNOWN;
+              break;
+            case MINE_ON_CHAR:
+              grid_val = force_on (-1);
+              break;
+            case MINE_OFF_CHAR:
+              grid_val = force_off (-1);
+              break;
+            default:
+              grid_val = TILE_MAP(inbuf[j]);
+              break;
+            }
+
+          grid[i][j+1] = grid_val;
+        }
     }
 
   // Set outside boundary to off. For efficiency, loops are not combined.
@@ -838,6 +1017,9 @@ Usage:\n\
   ms_solve [OPTION]... [FILE]\n\n\
 Options:\n\
   -a                Find all solutions.\n\
+  -f                During search, whenever possible, force the state of an\n\
+                    unknown to be on or off. This effectively reduces the\n\
+                    depth of the search.\n\
   -h                Print this help message.\n\
   -m MINE_TARGET    Set a target number of mines.\n\
   -p PRINT          Print solutions.\n\
@@ -846,5 +1028,8 @@ Options:\n\
                       2    Print basic information.\n\
                       3    Print found solutions.\n\
   -r                Pre-resolve unknowns.\n\
+  -s                Sort unknowns before searching. Unknowns are sorted in\n\
+                    increasing order by the number of surrounding numbered\n\
+                    tiles they have.\n\
   -t THREADS        Number of threads to use.\n\n");
 }
