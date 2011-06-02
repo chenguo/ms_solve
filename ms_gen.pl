@@ -31,6 +31,7 @@ my $dim_x = $ARGV[0];
 my $dim_y = $ARGV[1];
 my $mines = $ARGV[2];
 my $q_pct = $ARGV[3];
+my $seed = $ARGV[4];
 
 my $ntiles = $dim_x * $dim_y;
 if ($mines > $ntiles)
@@ -48,6 +49,8 @@ if ($q_pct < 0 || $q_pct > 100)
 {
     print STDERR "Invalid blank percentage: $q_pct%\n";
 }
+
+if (defined $seed) { srand ($seed) }
 
 #print "Width: $dim_x  Height: $dim_y  Mines: $mines  Blanks: $q_pct%\n";
 print "$dim_x x $dim_y\n";
