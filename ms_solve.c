@@ -88,6 +88,8 @@ static bool sort = false;        // Sort unknown order.
 static int mine_target = -1;     // Number of desired mines in solution.
 enum { PRINT_NONE, PRINT_MIN, PRINT_BASIC, PRINT_ALL, PRINT_DEBUG };
 static int print = PRINT_BASIC;   // Print boards.
+static int guess = false;
+static int diag = false;
 
 /* For thread control */
 static int max_threads = 1;      // Threads to use.
@@ -105,9 +107,13 @@ static void preprocess_grid ();
 static void * solve_tree_thr (void *);
 static int solve_tree (int, int, struct buffers);
 static int solve_subtree (int, int, struct buffers, bool);
-static bool consistency_check (struct ind, int **, int);
+static bool consistency_check (struct ind, int **, int, bool);
 static int find_unknowns (int **, struct ind *);
 static void clear_unknowns (int, struct ind *, int **);
+static inline int force_on (int);
+static inline int force_off (int);
+static inline bool is_mine (int);
+static inline int mine_src (int);
 
 /* Thread control functions. */
 static void thread_alloc ();
@@ -117,10 +123,7 @@ static void thread_free ();
 static void thread_copy (int, int);
 
 /* Misc functions. */
-static inline int force_on (int);
-static inline int force_off (int);
-static inline bool is_mine (int);
-static inline int mine_src (int);
+static void diag_print (struct ind *, int **);
 static void board_print (int **);
 static void parse_input (char *);
 static void help ();
@@ -130,7 +133,7 @@ int main (int argc, char **argv)
 {
   // Parse arguments.
   char c;
-  while ((c = getopt (argc, argv, "afhm:p:rst:")) != -1)
+  while ((c = getopt (argc, argv, "adfhm:p:rst:")) != -1)
     {
       switch (c)
         {
@@ -139,9 +142,21 @@ int main (int argc, char **argv)
           single = false;
           break;
 
+          // Diagnostic: print state of blank and sum of surrounding tiles.
+          // Note: don't put this in -h message.
+        case 'd':
+          diag = true;
+          break;
+
           // Force unknown state during search.
         case 'f':
           force = true;
+          break;
+
+          // Guess the state of the next mine. Only in effect if a target
+          // number of mines is set.
+        case 'g':
+          guess = true;
           break;
 
           // Help. Does not return.
@@ -269,6 +284,7 @@ static int resolve_tile (int row, int col, int **grid, int source, bool rec)
 {
 
   struct ind ind[8];
+  int pos[8];
   int unknowns = 0;
   int mines = 0;
   int resolved = 0;
@@ -278,6 +294,7 @@ static int resolve_tile (int row, int col, int **grid, int source, bool rec)
   if (tile_num < 0 || tile_num > 8)
     return 0;
 
+  int position = 0;
   for (i = -1; i < 2; i++)
     for (j = -1; j < 2; j++)
       {
@@ -285,10 +302,12 @@ static int resolve_tile (int row, int col, int **grid, int source, bool rec)
         if (grid[row+i][col+j] == UNKNOWN)
           {
             ind[unknowns].row = row + i;
-            ind[unknowns++].col = col + j;
+            ind[unknowns].col = col + j;
+            pos[unknowns++] = position;
           }
         else if (is_mine (grid[row+i][col+j]))
           mines++;
+        position++;
       }
 
   // If TILE_NUM matches the sum of mines and unkowns, all the unknowns are
@@ -325,19 +344,217 @@ static int resolve_tile (int row, int col, int **grid, int source, bool rec)
   return resolved;
 
   // Check for recursive mode.
+  // Source position: 0 1 2
+  //                  3 4 5
+  //                  6 7 8
+  // Recursive calls occur around a blank that was around the original tile.
+  // Based on the position of the blank, only some tiles need to be examined.
+  // We'll map it as such:
+  // Position 0: inspect L, UL, U
+  // Position 1: U
+  // Position 2: U, UR, R
+  // Position 3: L
+  // Position 4: impossible
+  // Position 5: R
+  // Position 6: L, BL, B
+  // Position 7: B
+  // Position 8: B, BR, R
+
   // TODO: control direction of frontier in recursion, for effcieny (i.e. don't
   // recheck what your parent just checked. */
   if (rec)
     {
       // For each unknown that was resolved, check it's neighbors.
       int k;
+      bool checked[16];
+      //  0  1  2  3  4
+      //  5  0  1  2  6
+      //  7  3     5  8
+      //  9  6  7  8 10
+      // 11 12 13 14 15
       for (k = 0; k < unknowns; k++)
         {
           row = ind[k].row;
           col = ind[k].col;
-          for (i = -1; i < 2; i++)
-            for (j = -1; j < 2; j++)
-              resolved += resolve_tile (row + i, col + j, grid, source, rec);
+          switch (pos[k])
+            {
+            case 0: // BL L UL U UR
+              if (!checked[7])
+                {
+                  resolved += resolve_tile (row+1, col-1, grid, source, rec);
+                  checked[7] = true;
+                }
+              if (!checked[5])
+                {
+                  resolved += resolve_tile (row, col-1, grid, source, rec);
+                  checked[5] = true;
+                }
+              if (!checked[0])
+                {
+                  resolved += resolve_tile (row-1, col-1, grid, source, rec);
+                  checked[0] = true;
+                }
+              if (!checked[1])
+                {
+                  resolved += resolve_tile (row-1, col, grid, source, rec);
+                  checked[1] = true;
+                }
+              if (!checked[2])
+                {
+                  resolved += resolve_tile (row-1, col+1, grid, source, rec);
+                  checked[2] = true;
+                }
+              break;
+            case 1: // UL U UR
+              if (!checked[1])
+                {
+                  resolved += resolve_tile (row-1, col-1, grid, source, rec);
+                  checked[1] = true;
+                }
+              if (!checked[2])
+                {
+                  resolved += resolve_tile (row-1, col, grid, source, rec);
+                  checked[2] = true;
+                }
+              if (!checked[3])
+                {
+                  resolved += resolve_tile (row-1, col+1, grid, source, rec);
+                  checked[3] = true;
+                }
+              break;
+            case 2: // UL U UR R BR
+              if (!checked[2])
+                {
+                  resolved += resolve_tile (row-1, col-1, grid, source, rec);
+                  checked[2] = true;
+                }
+              if (!checked[3])
+                {
+                  resolved += resolve_tile (row-1, col, grid, source, rec);
+                  checked[3] = true;
+                }
+              if (!checked[4])
+                {
+                  resolved += resolve_tile (row-1, col+1, grid, source, rec);
+                  checked[4] = true;
+                }
+              if (!checked[6])
+                {
+                  resolved += resolve_tile (row, col+1, grid, source, rec);
+                  checked[6] = true;
+                }
+              if (!checked[8])
+                {
+                  resolved += resolve_tile (row+1, col+1, grid, source, rec);
+                  checked[8];
+                }
+              break;
+            case 3:
+              if (!checked[5])
+                {
+                  resolved += resolve_tile (row-1, col-1, grid, source, rec);
+                  checked[5] = true;
+                }
+              if (!checked[7])
+                {
+                  resolved += resolve_tile (row, col-1, grid, source, rec);
+                  checked[7] = true;
+                }
+              if (!checked[9])
+                {
+                  resolved += resolve_tile (row+1, col-1, grid, source, rec);
+                  checked[9] = true;
+                }
+              break;
+            case 5:
+              if (!checked[6])
+                {
+                  resolved += resolve_tile (row-1, col+1, grid, source, rec);
+                  checked[6] = true;
+                }
+              if (!checked[8])
+                {
+                  resolved += resolve_tile (row, col+1, grid, source, rec);
+                  checked[8] = true;
+                }
+              if (!checked[10])
+                {
+                  resolved += resolve_tile (row+1, col+1, grid, source, rec);
+                  checked[10] = true;
+                }
+              break;
+            case 6:
+              if (!checked[7])
+                {
+                  resolved += resolve_tile (row-1, col-1, grid, source, rec);
+                  checked[7] = true;
+                }
+              if (!checked[9])
+                {
+                  resolved += resolve_tile (row, col-1, grid, source, rec);
+                  checked[9] = true;
+                }
+              if (!checked[11])
+                {
+                  resolved += resolve_tile (row+1, col-1, grid, source, rec);
+                  checked[11] = true;
+                }
+              if (!checked[12])
+                {
+                  resolved += resolve_tile (row+1, col, grid, source, rec);
+                  checked[12] = true;
+                }
+              if (!checked[13])
+                {
+                  resolved += resolve_tile (row+1, col+1, grid, source, rec);
+                  checked[13];
+                }
+              break;
+            case 7:
+              if (!checked[12])
+                {
+                  resolved += resolve_tile (row+1, col-1, grid, source, rec);
+                  checked[12] = true;
+                }
+              if (!checked[13])
+                {
+                  resolved += resolve_tile (row+1, col, grid, source, rec);
+                  checked[13] = true;
+                }
+              if (!checked[14])
+                {
+                  resolved += resolve_tile (row+1, col+1, grid, source, rec);
+                  checked[14] = true;
+                }
+              break;
+            case 8:
+              if (!checked[13])
+                {
+                  resolved += resolve_tile (row+1, col-1, grid, source, rec);
+                  checked[13] = true;
+                }
+              if (!checked[14])
+                {
+                  resolved += resolve_tile (row+1, col, grid, source, rec);
+                  checked[14] = true;
+                }
+              if (!checked[15])
+                {
+                  resolved += resolve_tile (row+1, col+1, grid, source, rec);
+                  checked[15] = true;
+                }
+              if (!checked[10])
+                {
+                  resolved += resolve_tile (row, col+1, grid, source, rec);
+                  checked[10] = true;
+                }
+              if (!checked[8])
+                {
+                  resolved += resolve_tile (row-1, col+1, grid, source, rec);
+                  checked[8];
+                }
+              break;
+            }
         }
     }
   return resolved;
@@ -512,17 +729,21 @@ static int solve_tree (int unknown_num, int mine_count, struct buffers bufs)
 
   if (mine_src (bufs.grid[row][col]) >= 0)
     {
-      // Unknown was pre-assigned. Just move on to next unknown.
+      // Unknown was pre-assigned. Just move on to next unknown if consistent.
+      if (!consistency_check (bufs.ind[unknown_num], bufs.grid, unknown_num, false))
+        return 0;
       if (is_mine (bufs.grid[row][col]))
         mine_count++;
       if (unknown_num == total_unknowns - 1
           && (mine_target == -1 || mine_count == mine_target))
         {
           num_goals++;
+          if (diag)
+            diag_print (bufs.ind, bufs.grid);
           if (print >= PRINT_ALL)
             board_print (bufs.grid);
         }
-      else
+      else if (unknown_num < total_unknowns - 1)
         num_goals = solve_tree (unknown_num+1, mine_count, bufs);
     }
   else if (mine_count == mine_target)
@@ -530,6 +751,13 @@ static int solve_tree (int unknown_num, int mine_count, struct buffers bufs)
       // All mines are used up, just check the MINE_OFF subtree. Do not thread.
       bufs.grid[row][col] = force_off (unknown_num);
       num_goals = solve_subtree (unknown_num, mine_count, bufs, false);
+    }
+  else if ((mine_target - mine_count) == (total_unknowns - unknown_num - 1))
+    {
+      // To be a solution, all remaining mines must be on. Just check the
+      // MINE_ON subtree. Do not thread.
+      bufs.grid[row][col] = force_on (unknown_num);
+      num_goals = solve_subtree (unknown_num, mine_count + 1, bufs, false);
     }
   else if (mine_target == -1 || mine_count < mine_target)
     {
@@ -590,7 +818,7 @@ static int solve_subtree (int unknown_num, int mine_count, struct buffers bufs,
   int col = bufs.ind[unknown_num].col;
 
   bool consis = consistency_check (bufs.ind[unknown_num], bufs.grid,
-                                   unknown_num);
+                                   unknown_num, true);
   if (consis)
     {
       // The mine state is valid. Check for subtrees, or if this branch of
@@ -650,6 +878,8 @@ static int solve_subtree (int unknown_num, int mine_count, struct buffers bufs,
           // 1) All unknowns have been assigned a valid state.
           // 2) MINE_TARGET, if specified, has been matched.
           num_goals++;
+          if (diag)
+            diag_print (bufs.ind, bufs.grid);
           if (print >= PRINT_ALL)
             board_print (bufs.grid);
         }
@@ -679,7 +909,8 @@ static int solve_subtree (int unknown_num, int mine_count, struct buffers bufs,
    Q: unknown tiles surrounding tile.
    A tile is consistent if M <= N <= M + Q
 */
-static bool consistency_check (struct ind ind, int **grid, int unknown_num)
+static bool consistency_check (struct ind ind, int **grid, int unknown_num,
+                               bool check_force)
 {
   int row = ind.row;
   int col = ind.col;
@@ -718,7 +949,7 @@ static bool consistency_check (struct ind ind, int **grid, int unknown_num)
               {
                 //fprintf (stderr, "[%d+%d][%d+%d] inconsis: tile %d  mines %d  unknowns %d\n",
                 //         row, i, col, j, tile_num, local_mines, local_unknowns);
-                board_print (grid);
+                //board_print (grid);
                 return false;
               }
 
@@ -730,7 +961,7 @@ static bool consistency_check (struct ind ind, int **grid, int unknown_num)
           }
       }
 
-  if (force)
+  if (force && check_force)
     {
       resolve_tile (row, col + 1, grid, unknown_num, false);
       for (j = -1; j < 2; j++)
@@ -763,6 +994,38 @@ static inline void clear_unknowns (int i, struct ind *ind, int **grid)
         }
     }
 }
+
+/* When an unknown is forced on/off, use this function to set the value.
+   Later, we can determine which unknown forced this unknown to turn on/off. */
+static inline int force_on (int unknown_num)
+{
+  return unknown_num + MINE_ON + 1;
+}
+static inline int force_off (int unknown_num)
+{
+  return -force_on (unknown_num);
+}
+
+/* Check if a mapped tile value denotes if the mine is on. False is returned
+   otherwise. This function is not meant to be used when the tile being checked
+   is not a mine. */
+static inline bool is_mine (int tile_val)
+{
+  return (tile_val >= MINE_ON);
+}
+
+/* Returns the index of the unknown tile that forced this mine to be on or
+   off. -1 is returned if TILE_VAL denotes an unknown or a number, or if this
+   mine was forced to be on/off from the start. */
+static inline int mine_src (int tile_val)
+{
+  int n = abs (tile_val);
+  if (n <= MINE_ON)
+    return -1;
+  else
+    return (n - MINE_ON - 1);
+}
+
 
 
 /*****************************************************************************
@@ -856,35 +1119,42 @@ static void thread_copy (int cpy, int orig)
  *
  ****************************************************************************/
 
-/* When an unknown is forced on/off, use this function to set the value.
-   Later, we can determine which unknown forced this unknown to turn on/off. */
-static inline int force_on (int unknown_num)
+/* Print diagnostic about the board. */
+static void diag_print (struct ind *ind, int **grid)
 {
-  return unknown_num + MINE_ON + 1;
-}
-static inline int force_off (int unknown_num)
-{
-  return -force_on (unknown_num);
-}
+  // For each blank, print its state and sum of neighbor tiles.
+  int i;
+  for (i = 0; i < total_unknowns; i++)
+    {
+      int row = ind[i].row;
+      int col = ind[i].col;
 
-/* Check if a mapped tile value denotes if the mine is on. False is returned
-   otherwise. This function is not meant to be used when the tile being checked
-   is not a mine. */
-static inline bool is_mine (int tile_val)
-{
-  return (tile_val >= MINE_ON);
-}
+      // Sum neighbors.
+      int j;
+      int k;
+      double sum = 0;
+      double numbered_tiles = 0;
+      for (j = -1; j < 2; j++)
+        for (k = -1; k < 2; k++)
+          {
+            int val = grid[row+j][col+k];
+            if (0 <= val && val <= 8)
+              {
+                sum += val;
+                numbered_tiles++;
+              }
+          }
 
-/* Returns the index of the unknown tile that forced this mine to be on or
-   off. -1 is returned if TILE_VAL denotes an unknown or a number, or if this
-   mine was forced to be on/off from the start. */
-static inline int mine_src (int tile_val)
-{
-  int n = abs (tile_val);
-  if (n <= MINE_ON)
-    return -1;
-  else
-    return (n - MINE_ON - 1);
+      if (numbered_tiles)
+        {
+          // Add 0.5 so integer truncation leads to average.
+          double avg = sum / numbered_tiles + 0.5;
+          if (is_mine (grid[row][col]))
+            printf ("%d:on\n", (int) avg);
+          else
+            printf ("%d:off\n", (int) avg);
+        }
+    }
 }
 
 /* Print the game board. */
